@@ -157,4 +157,7 @@ verify: tidy fmt vet
 	@echo ">>> Running golangci-lint..."
 	golangci-lint run ./...
 	@echo ""
+	@echo ">>> Coverage Summary:"
+	@$(GOCMD) tool cover -func=coverage.out | tail -n 1
+	@echo ""
 	@echo "=== All CI checks passed! ==="
