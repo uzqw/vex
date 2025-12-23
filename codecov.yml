@@ -1,0 +1,25 @@
+# Codecov configuration
+# https://docs.codecov.com/docs/codecovyml-reference
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 5%
+    patch:
+      default:
+        target: auto
+
+ignore:
+  # Entry points, integration tested
+  - "cmd/**/*"
+  # Thin wrapper around stdlib
+  - "pkg/logger/**/*"
+  # Test files themselves
+  - "**/*_test.go"
+
+comment:
+  layout: "reach,diff,flags,files"
+  behavior: default
+  require_changes: true

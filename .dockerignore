@@ -1,0 +1,35 @@
+# Build artifacts
+bin/
+build/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test files
+*.test
+*.out
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Docs (optional, can remove if you want docs in image)
+docs/
+*.md
+!README.md
+
+# Development files
+Makefile
+.github/

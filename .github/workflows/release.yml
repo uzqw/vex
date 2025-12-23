@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Run tests
+        run: go test -race ./internal/...
+
+      - name: Build binaries
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          LDFLAGS="-s -w -X main.Version=${VERSION}"
+          # Linux
+          GOOS=linux GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/vex-linux-amd64 ./cmd/server
+          GOOS=linux GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o dist/vex-linux-arm64 ./cmd/server
+          # macOS
+          GOOS=darwin GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/vex-darwin-amd64 ./cmd/server
+          GOOS=darwin GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o dist/vex-darwin-arm64 ./cmd/server
+          # Windows
+          GOOS=windows GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/vex-windows-amd64.exe ./cmd/server
+
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*
