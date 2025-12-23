@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -65,6 +66,15 @@ func init() {
 	}
 
 	flag.Parse()
+
+	// Handle version detection for 'go install'
+	if Version == "dev" {
+		if info, ok := debug.ReadBuildInfo(); ok {
+			if info.Main.Version != "" && info.Main.Version != "(devel)" {
+				Version = info.Main.Version
+			}
+		}
+	}
 
 	if *showVer {
 		fmt.Printf("Vex server version %s\n", Version)

@@ -20,6 +20,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"runtime/debug"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -65,6 +66,15 @@ func main() {
 	}
 
 	flag.Parse()
+
+	// Handle version detection for 'go install'
+	if Version == "dev" {
+		if info, ok := debug.ReadBuildInfo(); ok {
+			if info.Main.Version != "" && info.Main.Version != "(devel)" {
+				Version = info.Main.Version
+			}
+		}
+	}
 
 	if *showVer {
 		fmt.Printf("Vex benchmark version %s\n", Version)
