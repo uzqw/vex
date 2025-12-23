@@ -55,6 +55,15 @@ var (
 )
 
 func init() {
+	// Customize usage output
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: vex-server [options]\n\n")
+		fmt.Fprintf(os.Stderr, "Vex is a high-performance sharded in-memory vector database.\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nFor more information, visit https://github.com/uzqw/vex\n")
+	}
+
 	flag.Parse()
 
 	if *showVer {

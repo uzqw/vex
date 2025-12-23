@@ -6,8 +6,8 @@
 BUILD_DIR := bin
 
 # Binary names
-SERVER_BIN := $(BUILD_DIR)/server
-BENCHMARK_BIN := $(BUILD_DIR)/benchmark
+SERVER_BIN := $(BUILD_DIR)/vex-server
+BENCHMARK_BIN := $(BUILD_DIR)/vex-benchmark
 
 # Go commands
 GOCMD := go
@@ -31,46 +31,46 @@ build: build-server build-benchmark
 
 # Build server binary
 build-server:
-	@echo "Building server..."
+	@echo "Building vex-server..."
 	@mkdir -p $(BUILD_DIR)
-	$(GOBUILD) $(LDFLAGS) -o $(SERVER_BIN) ./cmd/server
+	$(GOBUILD) $(LDFLAGS) -o $(SERVER_BIN) ./cmd/vex-server
 
 # Build benchmark binary
 build-benchmark:
-	@echo "Building benchmark..."
+	@echo "Building vex-benchmark..."
 	@mkdir -p $(BUILD_DIR)
-	$(GOBUILD) $(LDFLAGS) -o $(BENCHMARK_BIN) ./cmd/benchmark
+	$(GOBUILD) $(LDFLAGS) -o $(BENCHMARK_BIN) ./cmd/vex-benchmark
 
 # Run server directly
 run:
 	@echo "Starting Vex server..."
-	$(GORUN) ./cmd/server/main.go
+	$(GORUN) ./cmd/vex-server/main.go
 
 # Run server with JSON logging
 run-json:
 	@echo "Starting Vex server with JSON logging..."
-	$(GORUN) ./cmd/server/main.go -log-format=json
+	$(GORUN) ./cmd/vex-server/main.go -log-format=json
 
 # Run server with debug logging
 run-debug:
 	@echo "Starting Vex server with debug logging..."
-	$(GORUN) ./cmd/server/main.go -log-level=debug
+	$(GORUN) ./cmd/vex-server/main.go -log-level=debug
 
 # Run benchmark (insert mode)
 benchmark:
 	@echo "Running insert benchmark..."
-	$(GORUN) ./cmd/benchmark/main.go -mode=insert -concurrency=50 -n=100000
+	$(GORUN) ./cmd/vex-benchmark/main.go -mode=insert -concurrency=50 -n=100000
 
 # Run benchmark (search mode)
 benchmark-search:
 	@echo "Running search benchmark..."
-	$(GORUN) ./cmd/benchmark/main.go -mode=search -concurrency=50 -n=50000
+	$(GORUN) ./cmd/vex-benchmark/main.go -mode=search -concurrency=50 -n=50000
 
 # Run custom benchmark
 benchmark-custom:
 	@echo "Running custom benchmark..."
 	@echo "Usage: make benchmark-custom ARGS='-mode=insert -concurrency=100 -n=200000'"
-	$(GORUN) ./cmd/benchmark/main.go $(ARGS)
+	$(GORUN) ./cmd/vex-benchmark/main.go $(ARGS)
 
 # Run tests
 test:
@@ -128,9 +128,9 @@ help:
 	@echo ""
 	@echo "Available targets:"
 	@echo "  all              - Format, tidy, and build everything (default)"
-	@echo "  build            - Build server and benchmark binaries"
-	@echo "  build-server     - Build only the server binary"
-	@echo "  build-benchmark  - Build only the benchmark binary"
+	@echo "  build            - Build vex-server and vex-benchmark binaries"
+	@echo "  build-server     - Build only the vex-server binary"
+	@echo "  build-benchmark  - Build only the vex-benchmark binary"
 	@echo "  run              - Run the server directly"
 	@echo "  run-json         - Run the server with JSON logging"
 	@echo "  run-debug        - Run the server with debug logging"

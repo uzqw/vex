@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -55,6 +56,14 @@ type BenchmarkResult struct {
 }
 
 func main() {
+	// Customize usage output
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: vex-benchmark [options]\n\n")
+		fmt.Fprintf(os.Stderr, "Vex Benchmark is a performance validation tool for the Vex vector database.\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+	}
+
 	flag.Parse()
 
 	if *showVer {

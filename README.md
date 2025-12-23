@@ -60,8 +60,8 @@ docker run -p 6379:6379 vex
 ### Install from Source
 
 ```bash
-# Install server binary to $GOPATH/bin
-go install github.com/uzqw/vex/cmd/server@latest
+# Install vex-server binary to $GOPATH/bin
+go install github.com/uzqw/vex/cmd/vex-server@latest
 ```
 
 ### Using the Server
@@ -101,7 +101,7 @@ sudo pacman -S redis
 
 - `PING [message]` - Test connection
 - `ECHO message` - Echo back a message
-- `STATS` / `INFO` - Get server statistics
+- `STATS` / `INFO` - Get vex statistics
 - `QUIT` - Close connection
 
 ### Vector Commands
@@ -164,7 +164,7 @@ CLEAR
 
 ### Stats Command
 
-Get real-time server metrics:
+Get real-time vex metrics:
 
 ```
 STATS
@@ -184,6 +184,12 @@ ${JSON}
 
 ### Run Insert Benchmark
 
+A comprehensive benchmark tool is available in `cmd/vex-benchmark`:
+```bash
+go run cmd/vex-benchmark/main.go -mode=insert -n=100000
+```
+
+You can also use the `make` targets:
 ```bash
 # Default: 50 concurrent connections, 100k operations, 128 dimensions
 make benchmark

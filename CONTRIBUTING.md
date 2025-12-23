@@ -30,6 +30,10 @@ Thank you for your interest in contributing to Vex! This document provides guide
 make build
 ```
 
+This will generate the following binaries in the `bin/` directory:
+- `vex-server`: The main vector database server.
+- `vex-benchmark`: The benchmarking and performance validation tool.
+
 ### Running Tests
 
 ```bash

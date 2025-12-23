@@ -32,13 +32,13 @@ jobs:
           VERSION=${GITHUB_REF#refs/tags/}
           LDFLAGS="-s -w -X main.Version=${VERSION}"
           # Linux
-          GOOS=linux GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/vex-linux-amd64 ./cmd/server
-          GOOS=linux GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o dist/vex-linux-arm64 ./cmd/server
+          GOOS=linux GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/vex-server-linux-amd64 ./cmd/vex-server
+          GOOS=linux GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o dist/vex-server-linux-arm64 ./cmd/vex-server
           # macOS
-          GOOS=darwin GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/vex-darwin-amd64 ./cmd/server
-          GOOS=darwin GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o dist/vex-darwin-arm64 ./cmd/server
+          GOOS=darwin GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/vex-server-darwin-amd64 ./cmd/vex-server
+          GOOS=darwin GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o dist/vex-server-darwin-arm64 ./cmd/vex-server
           # Windows
-          GOOS=windows GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/vex-windows-amd64.exe ./cmd/server
+          GOOS=windows GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/vex-server-windows-amd64.exe ./cmd/vex-server
 
       - name: Create checksums
         run: |
