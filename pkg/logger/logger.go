@@ -75,7 +75,7 @@ func Default() *Logger {
 // This is crucial for tracing requests across the system
 func (l *Logger) WithRequestID(ctx context.Context, requestID string) *Logger {
 	return &Logger{
-		Logger: l.Logger.With(slog.String("request_id", requestID)),
+		Logger: l.With(slog.String("request_id", requestID)),
 	}
 }
 
@@ -86,6 +86,6 @@ func (l *Logger) WithFields(fields map[string]any) *Logger {
 		args = append(args, slog.Any(k, v))
 	}
 	return &Logger{
-		Logger: l.Logger.With(args...),
+		Logger: l.With(args...),
 	}
 }

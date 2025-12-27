@@ -116,7 +116,7 @@ func main() {
 		log.Error("failed to start listener", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	log.Info("server started successfully", slog.String("addr", addr))
 
@@ -132,7 +132,7 @@ func main() {
 		sig := <-sigChan
 		log.Info("received shutdown signal", slog.String("signal", sig.String()))
 		cancel()
-		listener.Close()
+		_ = listener.Close()
 	}()
 
 	// Start memory monitoring goroutine
@@ -161,7 +161,7 @@ func main() {
 // handleConnection processes a single client connection
 func handleConnection(ctx context.Context, conn net.Conn) {
 	defer func() {
-		conn.Close()
+		_ = conn.Close()
 		metrics.Global().DecrementActiveConnections()
 	}()
 

@@ -122,7 +122,7 @@ func runInsertBenchmark() *BenchmarkResult {
 				errorCount.Add(int64(opsPerWorker))
 				return
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			writer := protocol.NewRESPWriter(conn)
 			reader := protocol.NewRESPReader(conn)
@@ -184,7 +184,7 @@ func runSearchBenchmark() *BenchmarkResult {
 				errorCount.Add(int64(opsPerWorker))
 				return
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			writer := protocol.NewRESPWriter(conn)
 			reader := protocol.NewRESPReader(conn)
@@ -228,7 +228,7 @@ func prepareSearchData() {
 		fmt.Printf("Failed to connect: %s\n", err)
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	writer := protocol.NewRESPWriter(conn)
 	reader := protocol.NewRESPReader(conn)
