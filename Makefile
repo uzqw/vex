@@ -1,5 +1,6 @@
 .PHONY: all build build-server build-benchmark run run-json run-debug \
-        benchmark benchmark-search benchmark-custom test test-coverage test-race \
+        bench bench-all bench-integration bench-unit benchmark benchmark-search benchmark-custom \
+        test test-coverage test-race \
         fmt vet lint tidy clean install-tools help verify
 
 # Build output directory
@@ -66,6 +67,28 @@ benchmark-search:
 	@echo "Running search benchmark..."
 	$(GORUN) ./cmd/vex-benchmark/main.go -mode=search -concurrency=50 -n=50000
 
+# Run all benchmarks (unit + integration)
+bench: bench-unit bench-integration
+
+# Run all unit benchmarks
+bench-all: bench-unit
+
+# Run unit benchmarks (micro-level performance tests)
+bench-unit:
+	@echo "Running unit benchmarks..."
+	$(GOTEST) -bench=. -benchmem -benchtime=3s ./benchmarks/...
+
+# Run storage benchmarks specifically
+bench-storage: bench-unit
+
+# Integration benchmarks (requires running server)
+bench-integration:
+	@echo "Running integration benchmarks..."
+	@echo "Note: Ensure vex-server is running on localhost:6379"
+	@echo ""
+	$(GORUN) ./cmd/vex-benchmark/main.go -mode=insert -concurrency=50 -n=100000
+	$(GORUN) ./cmd/vex-benchmark/main.go -mode=search -concurrency=50 -n=50000
+
 # Run custom benchmark
 benchmark-custom:
 	@echo "Running custom benchmark..."
@@ -127,24 +150,43 @@ help:
 	@echo "Vex Makefile"
 	@echo ""
 	@echo "Available targets:"
+	@echo ""
+	@echo "Building:"
 	@echo "  all              - Format, tidy, and build everything (default)"
 	@echo "  build            - Build vex-server and vex-benchmark binaries"
 	@echo "  build-server     - Build only the vex-server binary"
 	@echo "  build-benchmark  - Build only the vex-benchmark binary"
+	@echo ""
+	@echo "Running:"
 	@echo "  run              - Run the server directly"
 	@echo "  run-json         - Run the server with JSON logging"
 	@echo "  run-debug        - Run the server with debug logging"
-	@echo "  benchmark        - Run insert benchmark"
-	@echo "  benchmark-search - Run search benchmark"
+	@echo ""
+	@echo "Benchmarking:"
+	@echo "  bench            - Run unit benchmarks then integration benchmarks"
+	@echo "  bench-all        - Run all unit benchmarks"
+	@echo "  bench-unit       - Run unit benchmarks (micro-level performance)"
+	@echo "  bench-storage    - Run storage layer benchmarks"
+	@echo "  bench-integration - Run integration benchmarks (requires running server)"
+	@echo "  benchmark        - Run insert benchmark (legacy, same as: go run cmd/vex-benchmark)"
+	@echo "  benchmark-search - Run search benchmark (legacy)"
+	@echo "  benchmark-custom - Run custom benchmark with ARGS flag"
+	@echo ""
+	@echo "Testing:"
 	@echo "  test             - Run all tests"
 	@echo "  test-coverage    - Run tests with coverage report"
+	@echo "  test-race        - Run tests with race detector"
+	@echo ""
+	@echo "Code Quality:"
 	@echo "  fmt              - Format all Go code"
 	@echo "  vet              - Run go vet"
-	@echo "  tidy             - Tidy Go modules"
-	@echo "  clean            - Clean build artifacts"
 	@echo "  lint             - Run golangci-lint"
-	@echo "  install-tools    - Install development tools"
+	@echo "  tidy             - Tidy Go modules"
 	@echo "  verify           - Run all verification checks locally (test, lint, race)"
+	@echo ""
+	@echo "Maintenance:"
+	@echo "  clean            - Clean build artifacts"
+	@echo "  install-tools    - Install development tools"
 	@echo "  help             - Show this help message"
 
 # Run all verify checks locally (mirrors GitHub Actions CI)

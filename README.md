@@ -182,42 +182,87 @@ ${JSON}
 
 ## Benchmarking
 
-### Run Insert Benchmark
+Vex includes comprehensive performance benchmarks at both the unit and integration levels.
 
-A comprehensive benchmark tool is available in `cmd/vex-benchmark`:
+### Unit Benchmarks (Micro-level)
+
+Test individual components in isolation:
+
 ```bash
-go run cmd/vex-benchmark/main.go -mode=insert -n=100000
+# Run all unit benchmarks
+make bench-unit
+
+# Or directly with Go
+go test -bench=. -benchmem ./benchmarks/...
 ```
 
-You can also use the `make` targets:
-```bash
-# Default: 50 concurrent connections, 100k operations, 128 dimensions
-make benchmark
+### Integration Benchmarks (End-to-End)
 
-# Custom parameters
+Test the complete system with realistic workloads. Requires a running server:
+
+```bash
+# Terminal 1: Start the server
+make run
+
+# Terminal 2: Run benchmarks
+make bench-integration
+```
+
+### Complete Benchmark Suite
+
+Run both unit and integration benchmarks:
+
+```bash
+# Run all benchmarks
+./benchmarks/run-all.sh
+
+# Or using make
+make bench
+```
+
+### Detailed Usage
+
+For comprehensive documentation on benchmarking, see [benchmarks/README.md](benchmarks/README.md).
+
+#### Unit Benchmark Examples
+
+```bash
+# Run storage benchmarks
+go test -bench=BenchmarkStorage -benchmem ./benchmarks/storage/
+
+# Run with CPU profiling
+go test -bench=. -benchmem -cpuprofile=cpu.prof ./benchmarks/storage/
+go tool pprof -http=:8080 cpu.prof
+
+# Compare with previous results
+go install golang.org/x/perf/cmd/benchstat@latest
+go test -bench=. -benchmem ./benchmarks/storage/ > new.txt
+benchstat old.txt new.txt
+```
+
+#### Integration Benchmark Examples
+
+```bash
+# Custom insert benchmark
 make benchmark-custom ARGS="-mode=insert -concurrency=100 -n=200000 -dim=256"
+
+# Custom search benchmark
+make benchmark-custom ARGS="-mode=search -concurrency=50 -n=100000"
+
+# Or run directly
+go run cmd/vex-benchmark/main.go -mode=insert -concurrency=50 -n=100000
 ```
 
-### Run Search Benchmark
-
-```bash
-# Default: 50 concurrent connections, 50k operations
-make benchmark-search
-
-# Custom parameters
-make benchmark-custom ARGS="-mode=search -concurrency=100 -n=100000"
-```
-
-### Example Output
+### Example Integration Benchmark Output
 
 ```
 === Vex Benchmark ===
-Mode:        Insert
+Mode:        insert
 Concurrency: 50
-Total Ops:   100,000
+Total Ops:   100000
 ---
 Total Time:    1.25s
-QPS:           80,000 ops/sec
+QPS:           80000 ops/sec
 Success:       100000
 Errors:        0
 
@@ -230,24 +275,43 @@ Latency Statistics:
   Max:         5.3ms
 ```
 
+### Make Targets for Benchmarking
+
+```bash
+make bench              # Run all benchmarks (unit + integration)
+make bench-all          # Run all unit benchmarks
+make bench-unit         # Run unit benchmarks only
+make bench-storage      # Run storage layer benchmarks
+make bench-integration  # Run integration benchmarks (requires running server)
+make benchmark          # Legacy: insert benchmark
+make benchmark-search   # Legacy: search benchmark
+make benchmark-custom   # Custom benchmark with parameters
+```
+
 ## Development
 
 ### Project Structure
 
 ```
-Vex/
+vex/
+├── benchmarks/              # Performance benchmarks
+│   ├── storage/             # Storage layer benchmarks
+│   ├── README.md            # Comprehensive benchmark guide
+│   ├── run-all.sh           # Run all benchmarks script
+│   └── storage/README.md    # Storage benchmark details
 ├── cmd/
-│   ├── server/           # Main server entry point
-│   └── benchmark/        # Performance testing tool
+│   ├── vex-server/          # Main server entry point
+│   └── vex-benchmark/       # Integration benchmark tool
 ├── internal/
-│   ├── protocol/         # RESP protocol parsing
-│   ├── storage/          # Sharded vector storage
-│   ├── vector/           # Vector computation
-│   └── metrics/          # Performance metrics
+│   ├── protocol/            # RESP protocol parsing
+│   ├── storage/             # Sharded vector storage
+│   ├── vector/              # Vector computation
+│   └── metrics/             # Performance metrics
 ├── pkg/
-│   └── logger/           # Structured logging
-└── docs/
-    └── design_spec.md    # Architecture specification
+│   └── logger/              # Structured logging
+├── docs/
+│   └── 01_v3_design_spec.md # Architecture specification
+└── README.md                # This file
 ```
 
 ### Available Make Targets
