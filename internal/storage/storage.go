@@ -17,7 +17,6 @@ package storage
 import (
 	"container/heap"
 	"fmt"
-	"hash/fnv"
 	"sync"
 	"sync/atomic"
 
@@ -39,7 +38,7 @@ const (
 type shard struct {
 	mu   sync.RWMutex
 	data map[string][]float32
-	_    [CacheLineSize - 16]byte // Padding to prevent false sharing (adjust based on struct size)
+	_    [CacheLineSize - 32]byte // Padding: RWMutex(24) + map(8) = 32 bytes, pad to 64
 }
 
 // Storage is a sharded, thread-safe in-memory vector storage
@@ -60,11 +59,15 @@ func New() *Storage {
 	return s
 }
 
-// getShard returns the shard for a given key
+// getShard returns the shard for a given key using inline FNV-1a hashing
 func (s *Storage) getShard(key string) *shard {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return s.shards[h.Sum32()%ShardCount]
+	// Inline FNV-1a hash: avoids object allocation overhead
+	h := uint32(2166136261) // FNV offset basis
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619 // FNV prime
+	}
+	return s.shards[h%ShardCount]
 }
 
 // Set stores a vector with the given key
