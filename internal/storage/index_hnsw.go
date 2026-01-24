@@ -362,3 +362,43 @@ func (h *HNSWIndex) Count() int {
 	defer h.mu.RUnlock()
 	return len(h.nodes)
 }
+
+// IndexStats contains statistics about the HNSW index
+type IndexStats struct {
+	TotalVectors    int            // Total number of vectors in index
+	MaxLevel        int            // Maximum layer level in the graph
+	LayerDistribution map[int]int   // Number of nodes at each layer
+	AverageNeighbors float32       // Average neighbors per node
+}
+
+// GetStats returns statistical information about the index
+func (h *HNSWIndex) GetStats() IndexStats {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	stats := IndexStats{
+		TotalVectors:      len(h.nodes),
+		MaxLevel:          h.maxLevel,
+		LayerDistribution: make(map[int]int),
+	}
+
+	// Count nodes at each layer
+	var totalNeighbors int
+	for _, node := range h.nodes {
+		for level := 0; level <= node.Level; level++ {
+			stats.LayerDistribution[level]++
+			totalNeighbors += len(node.Neighbors[level])
+		}
+	}
+
+	// Calculate average neighbors
+	totalNodes := 0
+	for _, count := range stats.LayerDistribution {
+		totalNodes += count
+	}
+	if totalNodes > 0 {
+		stats.AverageNeighbors = float32(totalNeighbors) / float32(totalNodes)
+	}
+
+	return stats
+}
