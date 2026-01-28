@@ -1,0 +1,40 @@
+# Use Ubuntu 22.04 for stability
+FROM ubuntu:22.04
+
+# Avoid interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Update and install system dependencies
+# build-essential: provides standard headers and build tools
+# clang/llvm: required by goat for C/C++ analysis
+# git: required to fetch the goat source code
+RUN apt-get update && apt-get install -y \
+    wget \
+    build-essential \
+    clang \
+    llvm-dev \
+    libclang-dev \
+    libc6-dev-i386 \
+    git \
+    ca-certificates \
+    gcc-multilib \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Go 1.23.4 manually to ensure compatibility
+# This avoids the outdated Go 1.18 version found in the Ubuntu 22.04 repositories
+RUN wget https://go.dev/dl/go1.23.4.linux-amd64.tar.gz && \
+    tar -C /usr/local -xzf go1.23.4.linux-amd64.tar.gz && \
+    rm go1.23.4.linux-amd64.tar.gz
+
+# Set Go environment variables
+ENV PATH="/usr/local/go/bin:/root/go/bin:${PATH}"
+
+# Install goat version 0.1.3
+# The @v0.1.3 suffix ensures the specific version is downloaded and compiled
+RUN go install github.com/gorse-io/goat@v0.1.3
+
+# Set the working directory inside the container
+WORKDIR /app
+
+# Default command (optional)
+# CMD ["goat", "--help"]
