@@ -84,6 +84,17 @@ When contributing performance improvements:
 4. **Run benchmarks**: Document performance changes
 5. **Update docs**: If changing APIs or performance characteristics
 
+## License Information
+
+Vex is licensed under **Apache License 2.0**.
+
+This project includes SIMD optimization code derived from [Weaviate](https://github.com/weaviate/weaviate) (BSD-3-Clause), which is fully compatible with Apache 2.0.
+
+📄 **License Documentation:**
+- [LICENSES.md](LICENSES.md) - Complete license information
+- [THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md) - Third-party license texts
+- [NOTICE](../NOTICE) - Attribution notices
+
 ## Additional Resources
 
 ### External Links

@@ -251,6 +251,22 @@ go test -bench=BenchmarkDotProductComparison -benchtime=3s | tee after.txt
 benchstat before.txt after.txt
 ```
 
+## License Information
+
+The C source files in `internal/vector/c/` are derived from [Weaviate](https://github.com/weaviate/weaviate), which is licensed under BSD-3-Clause.
+
+**Copyright Notice:**
+```
+Copyright (c) 2020-2025, Weaviate B.V.
+Licensed under BSD-3-Clause License
+```
+
+The BSD-3-Clause license is compatible with Apache 2.0 (Vex's main license). When modifying these files:
+
+1. ✓ Keep the Weaviate copyright header
+2. ✓ Maintain attribution in generated assembly
+3. ✓ See [THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md) for full license text
+
 ## References
 
 ### Tools
