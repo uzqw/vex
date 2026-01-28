@@ -35,6 +35,9 @@ go test -bench=BenchmarkIndexSearch_Comparison_128D_10K -benchtime=2s
 ### Building Assembly
 
 ```bash
+# First, build the Docker image if not already built
+docker build -f Dockerfile.goat -t goat-builder:latest .
+
 # Using Docker (recommended)
 docker run -it --rm -v ~/wp/vex:/app -w /app/internal/vector/asm goat-builder:latest bash
 goat ../c/dot_avx256_amd64.c -O3 -mavx2 -mfma

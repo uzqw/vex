@@ -32,8 +32,15 @@ We provide a Docker image with goat pre-installed:
 
 ```bash
 # Build the Docker image (if not already built)
+# -f Dockerfile.goat tells Docker to use this file instead of the default 'Dockerfile'
+# -t goat-builder:latest tags the image as 'goat-builder' with 'latest' tag
 docker build -f Dockerfile.goat -t goat-builder:latest .
 ```
+
+**What this does:**
+- `-f Dockerfile.goat`: Specifies the Dockerfile to use (not the default `Dockerfile`)
+- `-t goat-builder:latest`: Tags the built image with name `goat-builder` and tag `latest`
+- `.`: Build context is the current directory
 
 ### Option 2: Install goat locally
 
