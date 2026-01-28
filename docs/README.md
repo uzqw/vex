@@ -1,0 +1,109 @@
+# Vex Documentation
+
+Welcome to the Vex documentation! This directory contains detailed guides for building, testing, and optimizing the Vex vector database.
+
+## Documentation Index
+
+### Performance & Optimization
+- **[PERFORMANCE.md](PERFORMANCE.md)** - Comprehensive guide to SIMD optimizations, benchmarking, and performance analysis
+  - Performance benchmark results
+  - How to run performance tests
+  - Detailed analysis of speedups
+  - Memory efficiency analysis
+
+### Build & Development
+- **[BUILD.md](BUILD.md)** - Instructions for compiling SIMD assembly from C code
+  - Setting up the build environment
+  - Using Docker with goat
+  - Generating assembly code
+  - Troubleshooting build issues
+
+## Quick Links
+
+### Running Performance Tests
+
+```bash
+# Quick dot product benchmark
+cd internal/vector
+go test -bench=BenchmarkDotProductComparison -benchtime=3s -benchmem
+
+# HNSW index benchmarks
+cd benchmarks/storage
+go test -bench=BenchmarkIndexSearch_Comparison_128D_10K -benchtime=2s
+```
+
+### Building Assembly
+
+```bash
+# Using Docker (recommended)
+docker run -it --rm -v ~/wp/vex:/app -w /app/internal/vector/asm goat-builder:latest bash
+goat ../c/dot_avx256_amd64.c -O3 -mavx2 -mfma
+```
+
+## Performance Summary
+
+Vex achieves **4-8x performance improvement** for vector operations using SIMD assembly:
+
+| Dimension | Speedup |
+|-----------|---------|
+| 128D      | 4.4x    |
+| 256D      | 5.6x    |
+| 512D      | 6.7x    |
+| 1024D     | 8.5x    |
+
+*Tested on Intel Core Ultra 9 285H with AVX2 support*
+
+## Project Structure
+
+```
+vex/
+├── docs/                      # Documentation (you are here)
+│   ├── README.md             # This file
+│   ├── PERFORMANCE.md        # Performance guide
+│   └── BUILD.md              # Build instructions
+├── internal/
+│   ├── vector/               # Vector operations
+│   │   ├── c/               # C source for SIMD
+│   │   ├── asm/             # Generated assembly
+│   │   └── *.go             # Go implementation
+│   └── storage/             # Storage layer
+│       ├── index_hnsw.go    # HNSW index
+│       └── index_bruteforce.go
+├── benchmarks/              # Performance benchmarks
+│   └── storage/
+└── cmd/                     # Command-line tools
+```
+
+## Contributing
+
+When contributing performance improvements:
+
+1. **Modify C code** in `internal/vector/c/`
+2. **Regenerate assembly** using goat (see BUILD.md)
+3. **Run tests**: `go test ./...`
+4. **Run benchmarks**: Document performance changes
+5. **Update docs**: If changing APIs or performance characteristics
+
+## Additional Resources
+
+### External Links
+- [Weaviate Vector Database](https://github.com/weaviate/weaviate) - Reference implementation for SIMD optimizations
+- [Intel Intrinsics Guide](https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html) - SIMD instruction reference
+- [Go Assembly Documentation](https://go.dev/doc/asm) - Go assembly language reference
+
+### Related Documentation
+- Main README: `../README.md` - Project overview and getting started
+- API Documentation: Generate with `godoc -http=:6060`
+
+## Getting Help
+
+If you encounter issues:
+
+1. Check the troubleshooting sections in BUILD.md and PERFORMANCE.md
+2. Verify your environment matches the prerequisites
+3. Run tests with `-v` flag for detailed output
+4. Check CPU features: `grep avx2 /proc/cpuinfo`
+
+## License
+
+Apache License 2.0 - See LICENSE file in the project root
