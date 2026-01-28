@@ -68,13 +68,13 @@ func (h *candidateHeap) Pop() interface{} {
 // Space complexity: O(n * M) where M is the maximum number of neighbors per node
 type HNSWIndex struct {
 	mu          sync.RWMutex
-	nodes       map[string]*HNSWNode  // Map from key to node
-	entryPoint  *HNSWNode             // Entry point for search (highest level node)
-	maxLevel    int                   // Maximum layer level
-	levelMult   float32               // Multiplier for level assignment (typically 1.0/ln(2.0))
-	M           int                   // Maximum number of neighbors per layer
-	efConstruct int                   // Search width for construction
-	ef          int                   // Search width for search queries
+	nodes       map[string]*HNSWNode // Map from key to node
+	entryPoint  *HNSWNode            // Entry point for search (highest level node)
+	maxLevel    int                  // Maximum layer level
+	levelMult   float32              // Multiplier for level assignment (typically 1.0/ln(2.0))
+	M           int                  // Maximum number of neighbors per layer
+	efConstruct int                  // Search width for construction
+	ef          int                  // Search width for search queries
 }
 
 // NewHNSWIndex creates a new HNSW index with default parameters
@@ -365,10 +365,10 @@ func (h *HNSWIndex) Count() int {
 
 // IndexStats contains statistics about the HNSW index
 type IndexStats struct {
-	TotalVectors    int            // Total number of vectors in index
-	MaxLevel        int            // Maximum layer level in the graph
-	LayerDistribution map[int]int   // Number of nodes at each layer
-	AverageNeighbors float32       // Average neighbors per node
+	TotalVectors      int         // Total number of vectors in index
+	MaxLevel          int         // Maximum layer level in the graph
+	LayerDistribution map[int]int // Number of nodes at each layer
+	AverageNeighbors  float32     // Average neighbors per node
 }
 
 // GetStats returns statistical information about the index
