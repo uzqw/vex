@@ -229,3 +229,18 @@ func (s *Storage) Clear() {
 func (s *Storage) Dimension() int {
 	return int(s.dim.Load())
 }
+
+// GetAllKeys returns all keys currently in storage
+// Note: This is primarily for snapshot/persistence operations
+func (s *Storage) GetAllKeys() []string {
+	keys := make([]string, 0, s.Count())
+	for i := 0; i < ShardCount; i++ {
+		shard := s.shards[i]
+		shard.mu.RLock()
+		for key := range shard.data {
+			keys = append(keys, key)
+		}
+		shard.mu.RUnlock()
+	}
+	return keys
+}
