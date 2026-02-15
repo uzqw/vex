@@ -1,6 +1,6 @@
 .PHONY: all build build-server build-benchmark run run-json run-debug \
         bench bench-all bench-integration bench-unit benchmark benchmark-search benchmark-custom \
-        test test-coverage test-race \
+        test test-coverage test-race test-recall test-recall-report \
         fmt vet lint tidy clean install-tools help verify
 
 # Build output directory
@@ -112,6 +112,16 @@ test-race:
 	@echo "Running tests with race detector..."
 	$(GOTEST) -v -race ./...
 
+# Run HNSW recall@k accuracy tests
+test-recall:
+	@echo "Running HNSW recall@k accuracy tests..."
+	$(GOTEST) -v -run=TestHNSWRecallAccuracy ./benchmarks/storage/
+
+# Run recall tests with detailed report
+test-recall-report:
+	@echo "Generating HNSW recall accuracy report..."
+	$(GOTEST) -v -run=TestHNSWRecallReport ./benchmarks/storage/
+
 # Format code
 fmt:
 	@echo "Formatting code..."
@@ -176,6 +186,8 @@ help:
 	@echo "  test             - Run all tests"
 	@echo "  test-coverage    - Run tests with coverage report"
 	@echo "  test-race        - Run tests with race detector"
+	@echo "  test-recall      - Run HNSW recall@k accuracy tests"
+	@echo "  test-recall-report - Generate detailed recall accuracy report"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  fmt              - Format all Go code"

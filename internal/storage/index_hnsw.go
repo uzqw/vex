@@ -38,24 +38,38 @@ type HNSWNeighbor struct {
 	Distance float32
 }
 
-// candidateHeap is a max-heap of candidates (used in HNSW search)
-type candidateHeap []*candidate
-
 type candidate struct {
 	node     *HNSWNode
 	distance float32
 }
 
-// Heap interface implementation for candidateHeap
-func (h candidateHeap) Len() int           { return len(h) }
-func (h candidateHeap) Less(i, j int) bool { return h[i].distance > h[j].distance } // max-heap
-func (h candidateHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+// maxHeap is a max-heap: the furthest (worst) candidate is at the top.
+// Used for W (working set) to efficiently track the worst result and evict it.
+type maxHeap []*candidate
 
-func (h *candidateHeap) Push(x interface{}) {
-	*h = append(*h, x.(*candidate))
+func (h maxHeap) Len() int           { return len(h) }
+func (h maxHeap) Less(i, j int) bool { return h[i].distance > h[j].distance }
+func (h maxHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+func (h *maxHeap) Push(x interface{}) { *h = append(*h, x.(*candidate)) }
+func (h *maxHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
 }
 
-func (h *candidateHeap) Pop() interface{} {
+// minHeap is a min-heap: the closest (best) candidate is at the top.
+// Used for C (candidate set) so we always expand the nearest unvisited node first.
+type minHeap []*candidate
+
+func (h minHeap) Len() int           { return len(h) }
+func (h minHeap) Less(i, j int) bool { return h[i].distance < h[j].distance }
+func (h minHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+func (h *minHeap) Push(x interface{}) { *h = append(*h, x.(*candidate)) }
+func (h *minHeap) Pop() interface{} {
 	old := *h
 	n := len(old)
 	x := old[n-1]
@@ -73,8 +87,8 @@ type HNSWIndex struct {
 	maxLevel    int                  // Maximum layer level
 	levelMult   float32              // Multiplier for level assignment (typically 1.0/ln(2.0))
 	M           int                  // Maximum number of neighbors per layer
-	efConstruct int                  // Search width for construction
-	ef          int                  // Search width for search queries
+	EfConstruct int                  // Search width for construction
+	Ef          int                  // Search width for search queries
 }
 
 // NewHNSWIndex creates a new HNSW index with default parameters
@@ -83,9 +97,9 @@ func NewHNSWIndex() *HNSWIndex {
 		nodes:       make(map[string]*HNSWNode),
 		maxLevel:    0,
 		levelMult:   float32(1.0 / math.Log(2.0)),
-		M:           6,   // Default maximum neighbors per layer
-		efConstruct: 200, // Default construction beam width
-		ef:          200, // Default search beam width
+		M:           32,    // Maximum neighbors per layer
+		EfConstruct: 600,   // Construction beam width (balance quality and speed)
+		Ef:          600,   // Search beam width (balance quality and speed)
 	}
 }
 
@@ -94,10 +108,17 @@ func (h *HNSWIndex) assignLevel() int {
 	return int(-math.Log(rand.Float64()) * float64(h.levelMult))
 }
 
-// distanceBetween computes cosine similarity between two vectors
+// distanceBetween computes distance between two vectors
+// For normalized vectors, we use negative dot product as distance
+// This converts similarity maximization to distance minimization
 // Both vectors should be normalized, so similarity = dot product
 func distanceBetween(vec1, vec2 []float32) (float32, error) {
-	return vector.DotProduct(vec1, vec2)
+	sim, err := vector.DotProduct(vec1, vec2)
+	if err != nil {
+		return 0, err
+	}
+	// Return negative similarity as distance (higher similarity = lower distance)
+	return -sim, nil
 }
 
 // Insert adds a new vector to the HNSW index
@@ -141,7 +162,7 @@ func (h *HNSWIndex) Insert(key string, vec []float32) error {
 
 	// Insert node at all levels from level to 0
 	for lc := level; lc >= 0; lc-- {
-		candidates := h.searchLayerWithEf(vec, currentNearest, lc, h.efConstruct)
+		candidates := h.searchLayerWithEf(vec, currentNearest, lc, h.EfConstruct)
 		neighbors := h.getNeighbors(candidates, h.M)
 
 		// Add bidirectional links
@@ -194,123 +215,131 @@ func (h *HNSWIndex) Search(query []float32, k int) ([]vector.SearchResult, error
 	}
 
 	// Search at layer 0 with ef parameter
-	candidates := h.searchLayerWithEf(query, currentNearest, 0, h.ef)
+	candidates := h.searchLayerWithEf(query, currentNearest, 0, h.Ef)
 
 	// Extract top-k results
 	results := make([]vector.SearchResult, 0, k)
 	for i := 0; i < k && i < len(candidates); i++ {
 		distance, _ := distanceBetween(query, candidates[i].Vector)
+		// distance is negative similarity, so negate it to get actual similarity
 		results = append(results, vector.SearchResult{
 			Key:        candidates[i].ID,
-			Similarity: distance,
+			Similarity: -distance,
 		})
 	}
 
 	return results, nil
 }
 
-// searchLayer performs a greedy search on a specific layer
+// searchLayer performs a greedy search on a specific layer, returning the single closest node.
+// C (candidates) is a min-heap so we always expand the nearest node first.
+// W (working set) is a max-heap so we can cheaply evict the worst result.
 func (h *HNSWIndex) searchLayer(query []float32, entryPoint *HNSWNode, layer int, ef int) (*HNSWNode, float32) {
 	visited := make(map[*HNSWNode]bool)
-	candidates := make(candidateHeap, 0)
-	w := make(candidateHeap, 0)
+	C := make(minHeap, 0) // candidates: min-heap, closest at top
+	W := make(maxHeap, 0) // working set: max-heap, furthest (worst) at top
 
-	distance, _ := distanceBetween(query, entryPoint.Vector)
-	heap.Push(&candidates, &candidate{node: entryPoint, distance: distance})
-	heap.Push(&w, &candidate{node: entryPoint, distance: distance})
+	dist, _ := distanceBetween(query, entryPoint.Vector)
+	heap.Push(&C, &candidate{node: entryPoint, distance: dist})
+	heap.Push(&W, &candidate{node: entryPoint, distance: dist})
 	visited[entryPoint] = true
 
-	for len(candidates) > 0 {
-		lowerBound := candidates[0].distance
-		if lowerBound > w[len(w)-1].distance {
+	for len(C) > 0 {
+		// c = nearest candidate; f = furthest result in W
+		c := C[0].distance // min of C
+		f := W[0].distance // max of W (worst result)
+		// If even the closest candidate is worse than the worst result, stop.
+		if c > f {
 			break
 		}
 
-		current := heap.Pop(&candidates).(*candidate)
+		current := heap.Pop(&C).(*candidate)
 
-		if current.distance > lowerBound {
-			continue
-		}
-
-		// Check neighbors at this layer
 		if current.node.Level >= layer {
 			for _, neighbor := range current.node.Neighbors[layer] {
-				if !visited[neighbor.Node] {
-					visited[neighbor.Node] = true
-					distance, _ := distanceBetween(query, neighbor.Node.Vector)
+				if visited[neighbor.Node] {
+					continue
+				}
+				visited[neighbor.Node] = true
+				d, _ := distanceBetween(query, neighbor.Node.Vector)
 
-					if distance > w[0].distance || len(w) < ef {
-						heap.Push(&candidates, &candidate{node: neighbor.Node, distance: distance})
-						heap.Push(&w, &candidate{node: neighbor.Node, distance: distance})
-
-						if len(w) > ef {
-							heap.Pop(&w)
-						}
+				if d < W[0].distance || len(W) < ef {
+					heap.Push(&C, &candidate{node: neighbor.Node, distance: d})
+					heap.Push(&W, &candidate{node: neighbor.Node, distance: d})
+					if len(W) > ef {
+						heap.Pop(&W) // evict the worst
 					}
 				}
 			}
 		}
 	}
 
-	// Return the closest node
-	if len(w) > 0 {
-		return w[len(w)-1].node, w[len(w)-1].distance
+	// The closest node sits at the bottom of the max-heap; drain to find it.
+	var best *HNSWNode
+	var bestDist float32 = float32(math.Inf(1))
+	for _, c := range W {
+		if c.distance < bestDist {
+			bestDist = c.distance
+			best = c.node
+		}
 	}
-	return entryPoint, distance
+	if best != nil {
+		return best, bestDist
+	}
+	return entryPoint, dist
 }
 
-// searchLayerWithEf performs greedy search and returns multiple candidates sorted by similarity
+// searchLayerWithEf performs greedy search and returns up to ef candidates sorted closest-first.
+// C (candidates) is a min-heap; W (working set) is a max-heap.
 func (h *HNSWIndex) searchLayerWithEf(query []float32, entryPoint *HNSWNode, layer int, ef int) []*HNSWNode {
 	visited := make(map[*HNSWNode]bool)
-	candidates := make(candidateHeap, 0)
-	w := make(candidateHeap, 0)
+	C := make(minHeap, 0) // candidates: min-heap
+	W := make(maxHeap, 0) // working set: max-heap
 
-	distance, _ := distanceBetween(query, entryPoint.Vector)
-	heap.Push(&candidates, &candidate{node: entryPoint, distance: distance})
-	heap.Push(&w, &candidate{node: entryPoint, distance: distance})
+	dist, _ := distanceBetween(query, entryPoint.Vector)
+	heap.Push(&C, &candidate{node: entryPoint, distance: dist})
+	heap.Push(&W, &candidate{node: entryPoint, distance: dist})
 	visited[entryPoint] = true
 
-	for len(candidates) > 0 {
-		lowerBound := candidates[0].distance
-		if lowerBound > w[0].distance {
-			break
+	for len(C) > 0 {
+		c := C[0].distance // nearest candidate
+		f := W[0].distance // furthest result (worst in W)
+		if c > f {
+			break // no candidate can improve W
 		}
 
-		current := heap.Pop(&candidates).(*candidate)
+		current := heap.Pop(&C).(*candidate)
 
-		if current.distance > lowerBound {
-			continue
-		}
-
-		// Check neighbors
 		if current.node.Level >= layer {
 			for _, neighbor := range current.node.Neighbors[layer] {
-				if !visited[neighbor.Node] {
-					visited[neighbor.Node] = true
-					distance, _ := distanceBetween(query, neighbor.Node.Vector)
+				if visited[neighbor.Node] {
+					continue
+				}
+				visited[neighbor.Node] = true
+				d, _ := distanceBetween(query, neighbor.Node.Vector)
 
-					if distance > w[0].distance || len(w) < ef {
-						heap.Push(&candidates, &candidate{node: neighbor.Node, distance: distance})
-						heap.Push(&w, &candidate{node: neighbor.Node, distance: distance})
-
-						if len(w) > ef {
-							heap.Pop(&w)
-						}
+				if d < W[0].distance || len(W) < ef {
+					heap.Push(&C, &candidate{node: neighbor.Node, distance: d})
+					heap.Push(&W, &candidate{node: neighbor.Node, distance: d})
+					if len(W) > ef {
+						heap.Pop(&W) // evict furthest
 					}
 				}
 			}
 		}
 	}
 
-	// Convert heap to sorted result
-	result := make([]*HNSWNode, len(w))
-	for i := len(w) - 1; i >= 0; i-- {
-		result[i] = heap.Pop(&w).(*candidate).node
+	// Drain W into a slice sorted closest-first
+	result := make([]*HNSWNode, len(W))
+	for i := len(W) - 1; i >= 0; i-- {
+		result[i] = heap.Pop(&W).(*candidate).node
 	}
 	return result
 }
 
 // getNeighbors returns the M nearest neighbors from candidates
+// Simple greedy approach: select closest M candidates
+// For distributed/diverse neighborhoods, rely on proper ef/efConstruct parameters
 func (h *HNSWIndex) getNeighbors(candidates []*HNSWNode, m int) []*HNSWNode {
 	if len(candidates) <= m {
 		return candidates
@@ -326,16 +355,16 @@ func (h *HNSWIndex) pruneNeighbors(node *HNSWNode, layer int, m int) {
 	}
 
 	// Keep the m closest neighbors by distance
-	// Sort by distance in descending order (higher similarity first)
+	// Sort by distance in ascending order (smaller distance = closer)
 	for i := 0; i < len(neighbors); i++ {
 		for j := i + 1; j < len(neighbors); j++ {
-			if neighbors[j].Distance > neighbors[i].Distance {
+			if neighbors[j].Distance < neighbors[i].Distance {
 				neighbors[i], neighbors[j] = neighbors[j], neighbors[i]
 			}
 		}
 	}
 
-	// Keep only top m neighbors (highest similarity)
+	// Keep only top m neighbors (closest)
 	node.Neighbors[layer] = neighbors[:m]
 }
 
