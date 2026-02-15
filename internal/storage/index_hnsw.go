@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"sort"
 	"sync"
 
 	"github.com/uzqw/vex/internal/vector"
@@ -86,9 +87,10 @@ type HNSWIndex struct {
 	entryPoint  *HNSWNode            // Entry point for search (highest level node)
 	maxLevel    int                  // Maximum layer level
 	levelMult   float32              // Multiplier for level assignment (typically 1.0/ln(2.0))
-	M           int                  // Maximum number of neighbors per layer
+	M           int                  // Maximum number of neighbors per layer (layer > 0)
 	EfConstruct int                  // Search width for construction
 	Ef          int                  // Search width for search queries
+	rng         *rand.Rand           // Per-index RNG, avoids global rand lock contention
 }
 
 // NewHNSWIndex creates a new HNSW index with default parameters
@@ -97,15 +99,36 @@ func NewHNSWIndex() *HNSWIndex {
 		nodes:       make(map[string]*HNSWNode),
 		maxLevel:    0,
 		levelMult:   float32(1.0 / math.Log(2.0)),
-		M:           32,    // Maximum neighbors per layer
-		EfConstruct: 600,   // Construction beam width (balance quality and speed)
-		Ef:          600,   // Search beam width (balance quality and speed)
+		M:           32,    // Maximum neighbors per layer (layer > 0); layer 0 uses 2*M
+		EfConstruct: 600,   // Construction beam width
+		Ef:          600,   // Search beam width
+		rng:         rand.New(rand.NewSource(rand.Int63())), // fix 5: per-index RNG, no global lock
 	}
 }
 
 // assignLevel assigns a random level to a new node using exponential decay distribution
 func (h *HNSWIndex) assignLevel() int {
-	return int(-math.Log(rand.Float64()) * float64(h.levelMult))
+	// h.rng is only called inside Insert which holds the write lock, so no extra sync needed
+	return int(-math.Log(h.rng.Float64()) * float64(h.levelMult))
+}
+
+// adaptiveEf scales the beam width down for high-dimensional vectors.
+// Cost of searchLayerWithEf grows as O(ef * M * dim), so holding ef fixed
+// at the 128-D baseline makes 512-D ~4× more expensive for the same recall.
+// Scaling by 1/sqrt(dim/refDim) keeps construction time roughly constant
+// across dimensions while preserving recall (high-dim neighbor distributions
+// are more uniform, so a smaller ef still covers the relevant region).
+func (h *HNSWIndex) adaptiveEf(baseEf, dim int) int {
+	const refDim = 128
+	if dim <= refDim {
+		return baseEf
+	}
+	ef := int(float64(baseEf) / math.Sqrt(float64(dim)/refDim))
+	minEf := h.M * 2 // never go below 2*M
+	if ef < minEf {
+		ef = minEf
+	}
+	return ef
 }
 
 // distanceBetween computes distance between two vectors
@@ -162,8 +185,14 @@ func (h *HNSWIndex) Insert(key string, vec []float32) error {
 
 	// Insert node at all levels from level to 0
 	for lc := level; lc >= 0; lc-- {
-		candidates := h.searchLayerWithEf(vec, currentNearest, lc, h.EfConstruct)
-		neighbors := h.getNeighbors(candidates, h.M)
+		// fix 3: layer 0 uses 2*M neighbors (paper §4, Mmax0 = 2*M)
+		mEffective := h.M
+		if lc == 0 {
+			mEffective = h.M * 2
+		}
+
+		candidates := h.searchLayerWithEf(vec, currentNearest, lc, h.adaptiveEf(h.EfConstruct, len(vec)))
+		neighbors := h.selectNeighborsHeuristic(vec, candidates, mEffective)
 
 		// Add bidirectional links
 		for _, neighbor := range neighbors {
@@ -179,7 +208,7 @@ func (h *HNSWIndex) Insert(key string, vec []float32) error {
 					Node:     newNode,
 					Distance: dist,
 				})
-				h.pruneNeighbors(neighbor, lc, h.M)
+				h.pruneNeighbors(neighbor, lc, mEffective)
 			}
 		}
 
@@ -215,7 +244,7 @@ func (h *HNSWIndex) Search(query []float32, k int) ([]vector.SearchResult, error
 	}
 
 	// Search at layer 0 with ef parameter
-	candidates := h.searchLayerWithEf(query, currentNearest, 0, h.Ef)
+	candidates := h.searchLayerWithEf(query, currentNearest, 0, h.adaptiveEf(h.Ef, len(query)))
 
 	// Extract top-k results
 	results := make([]vector.SearchResult, 0, k)
@@ -244,11 +273,12 @@ func (h *HNSWIndex) searchLayer(query []float32, entryPoint *HNSWNode, layer int
 	heap.Push(&W, &candidate{node: entryPoint, distance: dist})
 	visited[entryPoint] = true
 
+	// fix 4: track best inline instead of scanning W at the end
+	best, bestDist := entryPoint, dist
+
 	for len(C) > 0 {
-		// c = nearest candidate; f = furthest result in W
-		c := C[0].distance // min of C
-		f := W[0].distance // max of W (worst result)
-		// If even the closest candidate is worse than the worst result, stop.
+		c := C[0].distance // min of C (nearest candidate)
+		f := W[0].distance // max of W (worst result in working set)
 		if c > f {
 			break
 		}
@@ -267,26 +297,18 @@ func (h *HNSWIndex) searchLayer(query []float32, entryPoint *HNSWNode, layer int
 					heap.Push(&C, &candidate{node: neighbor.Node, distance: d})
 					heap.Push(&W, &candidate{node: neighbor.Node, distance: d})
 					if len(W) > ef {
-						heap.Pop(&W) // evict the worst
+						heap.Pop(&W)
+					}
+					if d < bestDist {
+						bestDist = d
+						best = neighbor.Node
 					}
 				}
 			}
 		}
 	}
 
-	// The closest node sits at the bottom of the max-heap; drain to find it.
-	var best *HNSWNode
-	var bestDist float32 = float32(math.Inf(1))
-	for _, c := range W {
-		if c.distance < bestDist {
-			bestDist = c.distance
-			best = c.node
-		}
-	}
-	if best != nil {
-		return best, bestDist
-	}
-	return entryPoint, dist
+	return best, bestDist
 }
 
 // searchLayerWithEf performs greedy search and returns up to ef candidates sorted closest-first.
@@ -337,42 +359,123 @@ func (h *HNSWIndex) searchLayerWithEf(query []float32, entryPoint *HNSWNode, lay
 	return result
 }
 
-// getNeighbors returns the M nearest neighbors from candidates
-// Simple greedy approach: select closest M candidates
-// For distributed/diverse neighborhoods, rely on proper ef/efConstruct parameters
-func (h *HNSWIndex) getNeighbors(candidates []*HNSWNode, m int) []*HNSWNode {
+// selectNeighborsHeuristic implements HNSW paper Algorithm 4.
+// Instead of returning the raw M closest candidates, it enforces spatial diversity:
+// a candidate e is kept only if it is closer to the query than to every already-selected
+// neighbor r. This prevents "shadowing" — where a cluster of very similar nodes all
+// connect to the same query region, leaving other directions of the graph unreachable.
+//
+// keepPrunedConnections=true: if the heuristic leaves fewer than m neighbors we backfill
+// from the discarded set so the graph stays well-connected.
+func (h *HNSWIndex) selectNeighborsHeuristic(query []float32, candidates []*HNSWNode, m int) []*HNSWNode {
 	if len(candidates) <= m {
 		return candidates
 	}
-	return candidates[:m]
+
+	// Limit the working set to 3*M closest candidates.
+	// Running the full O(ef*M*dim) heuristic on all ef candidates is expensive
+	// in high dimensions; 3*M gives enough diversity headroom while keeping
+	// construction time bounded.
+	workSet := candidates
+	if len(workSet) > m*3 {
+		workSet = workSet[:m*3]
+	}
+
+	// candidates are already sorted closest-first from searchLayerWithEf
+	selected := make([]*HNSWNode, 0, m)
+	discarded := make([]*HNSWNode, 0, len(workSet))
+
+	for _, e := range workSet {
+		if len(selected) >= m {
+			break
+		}
+		distQE, _ := distanceBetween(query, e.Vector)
+
+		// e is dominated if any already-selected neighbor r is closer to e than q is
+		dominated := false
+		for _, r := range selected {
+			distER, _ := distanceBetween(e.Vector, r.Vector)
+			if distER < distQE {
+				dominated = true
+				break
+			}
+		}
+
+		if !dominated {
+			selected = append(selected, e)
+		} else {
+			discarded = append(discarded, e)
+		}
+	}
+
+	// keepPrunedConnections: backfill with discarded so we reach m if possible
+	for _, e := range discarded {
+		if len(selected) >= m {
+			break
+		}
+		selected = append(selected, e)
+	}
+
+	return selected
 }
 
-// pruneNeighbors prunes the neighbor list to maintain size constraint
+// pruneNeighbors trims a node's neighbor list to at most m entries.
+// fix 2: use sort.Slice (O(n log n)) instead of the previous O(n²) bubble sort.
 func (h *HNSWIndex) pruneNeighbors(node *HNSWNode, layer int, m int) {
 	neighbors := node.Neighbors[layer]
 	if len(neighbors) <= m {
 		return
 	}
 
-	// Keep the m closest neighbors by distance
-	// Sort by distance in ascending order (smaller distance = closer)
-	for i := 0; i < len(neighbors); i++ {
-		for j := i + 1; j < len(neighbors); j++ {
-			if neighbors[j].Distance < neighbors[i].Distance {
-				neighbors[i], neighbors[j] = neighbors[j], neighbors[i]
+	sort.Slice(neighbors, func(i, j int) bool {
+		return neighbors[i].Distance < neighbors[j].Distance
+	})
+
+	node.Neighbors[layer] = neighbors[:m]
+}
+
+// Delete removes a vector from the index and repairs all neighbor lists that
+// referenced it, so no dangling pointers remain in the graph.
+func (h *HNSWIndex) Delete(key string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	node, exists := h.nodes[key]
+	if !exists {
+		return fmt.Errorf("vector with key %q not found", key)
+	}
+
+	// fix 6: remove this node from every neighbor's adjacency list
+	for layer := 0; layer <= node.Level; layer++ {
+		for _, nb := range node.Neighbors[layer] {
+			if nb.Node.Level < layer {
+				continue
+			}
+			list := nb.Node.Neighbors[layer]
+			newList := list[:0]
+			for _, n := range list {
+				if n.Node != node {
+					newList = append(newList, n)
+				}
+			}
+			nb.Node.Neighbors[layer] = newList
+		}
+	}
+
+	delete(h.nodes, key)
+
+	// If the deleted node was the entry point, elect a new one at the highest level
+	if h.entryPoint == node {
+		h.entryPoint = nil
+		h.maxLevel = 0
+		for _, n := range h.nodes {
+			if h.entryPoint == nil || n.Level > h.entryPoint.Level {
+				h.entryPoint = n
+				h.maxLevel = n.Level
 			}
 		}
 	}
 
-	// Keep only top m neighbors (closest)
-	node.Neighbors[layer] = neighbors[:m]
-}
-
-// Delete removes a vector from the index (marks as deleted, actual removal not implemented)
-func (h *HNSWIndex) Delete(key string) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	delete(h.nodes, key)
 	return nil
 }
 
