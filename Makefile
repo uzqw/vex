@@ -115,12 +115,22 @@ test-race:
 # Run HNSW recall@k accuracy tests
 test-recall:
 	@echo "Running HNSW recall@k accuracy tests..."
-	$(GOTEST) -v -run=TestHNSWRecallAccuracy ./benchmarks/storage/
+	$(GOTEST) -v -count=1 -run=TestHNSWRecallAccuracy ./benchmarks/storage/
 
 # Run recall tests with detailed report
 test-recall-report:
 	@echo "Generating HNSW recall accuracy report..."
-	$(GOTEST) -v -run=TestHNSWRecallReport ./benchmarks/storage/
+	$(GOTEST) -v -count=1 -run=TestHNSWRecallReport ./benchmarks/storage/
+
+# Diagnose HNSW parameter impact on recall
+test-recall-diagnosis:
+	@echo "Diagnosing HNSW parameter impact on recall..."
+	$(GOTEST) -v -count=1 -run=TestHNSWParameterDiagnosis ./benchmarks/storage/
+
+# Test HNSW recall with clustered (realistic) data
+test-recall-clustered:
+	@echo "Testing HNSW recall with clustered data..."
+	$(GOTEST) -v -count=1 -run=TestHNSWRecallWithClusteredData ./benchmarks/storage/
 
 # Format code
 fmt:
