@@ -59,8 +59,8 @@ func TestAdaptiveEf(t *testing.T) {
 		wantMax int // result must be <= wantMax
 		wantMin int // result must be >= wantMin
 	}{
-		{64, base, h.M * 2},   // dim < 128: no scaling
-		{128, base, base},     // dim == 128: no scaling
+		{64, base, h.M * 2},  // dim < 128: no scaling
+		{128, base, base},    // dim == 128: no scaling
 		{256, base, h.M * 2}, // dim > 128: scaled down
 		{512, base, h.M * 2},
 	}

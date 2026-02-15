@@ -26,8 +26,8 @@ import (
 )
 
 const (
-	DefaultSeed     = 42
-	QuerySeedOffset = 1000
+	DefaultSeed      = 42
+	QuerySeedOffset  = 1000
 	TestVectorKeyFmt = "recall-test-vec-%08d"
 )
 
@@ -41,15 +41,15 @@ const (
 
 // RecallTestConfig defines parameters for a recall test
 type RecallTestConfig struct {
-	Name           string
-	Vectors        int
-	Dimension      int
-	KValues        []int
-	NumQueries     int
-	Seed           int64
-	Distribution   DataDistribution
-	NumClusters    int // For clustered distribution
-	ClusterSpread  float32 // Radius/spread of each cluster (0.0-1.0)
+	Name          string
+	Vectors       int
+	Dimension     int
+	KValues       []int
+	NumQueries    int
+	Seed          int64
+	Distribution  DataDistribution
+	NumClusters   int     // For clustered distribution
+	ClusterSpread float32 // Radius/spread of each cluster (0.0-1.0)
 }
 
 // generateTestVector generates a random normalized vector

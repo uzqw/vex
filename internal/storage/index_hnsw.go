@@ -100,9 +100,9 @@ func NewHNSWIndex() *HNSWIndex {
 		nodes:       make(map[string]*HNSWNode),
 		maxLevel:    0,
 		levelMult:   float32(1.0 / math.Log(2.0)),
-		M:           32,    // Maximum neighbors per layer (layer > 0); layer 0 uses 2*M
-		EfConstruct: 600,   // Construction beam width
-		Ef:          600,   // Search beam width
+		M:           32,                                     // Maximum neighbors per layer (layer > 0); layer 0 uses 2*M
+		EfConstruct: 600,                                    // Construction beam width
+		Ef:          600,                                    // Search beam width
 		rng:         rand.New(rand.NewSource(rand.Int63())), // fix 5: per-index RNG, no global lock
 	}
 }

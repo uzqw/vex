@@ -27,8 +27,8 @@ func (m *mockStorage) Set(key string, values []float32) error {
 	return nil
 }
 
-func (m *mockStorage) Count() int             { return len(m.data) }
-func (m *mockStorage) Dimension() int         { return m.dim }
+func (m *mockStorage) Count() int     { return len(m.data) }
+func (m *mockStorage) Dimension() int { return m.dim }
 func (m *mockStorage) GetAllKeys() []string {
 	keys := make([]string, 0, len(m.data))
 	for k := range m.data {
@@ -258,8 +258,8 @@ type failLoadSnapshotter struct {
 	err error
 }
 
-func (f *failLoadSnapshotter) Save(_ context.Context) error            { return nil }
-func (f *failLoadSnapshotter) Load(_ context.Context) error            { return f.err }
+func (f *failLoadSnapshotter) Save(_ context.Context) error                { return nil }
+func (f *failLoadSnapshotter) Load(_ context.Context) error                { return f.err }
 func (f *failLoadSnapshotter) GetLastSnapshotInfo() (*SnapshotInfo, error) { return nil, nil }
 
 func TestManagerStop(t *testing.T) {
