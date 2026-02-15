@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -204,12 +205,16 @@ func (s *VectorSnapshot) Load(ctx context.Context) error {
 	return nil
 }
 
-// GetLastSnapshotInfo returns metadata about the last snapshot
+// GetLastSnapshotInfo returns metadata about the last snapshot, or nil if none exists.
 func (s *VectorSnapshot) GetLastSnapshotInfo() (*SnapshotInfo, error) {
 	latestDir := filepath.Join(s.config.DataDir, "latest")
 	metadataPath := filepath.Join(latestDir, metadataFile)
 
-	return s.loadMetadata(metadataPath)
+	info, err := s.loadMetadata(metadataPath)
+	if errors.Is(err, ErrSnapshotNotFound) {
+		return nil, nil
+	}
+	return info, err
 }
 
 // saveVectors writes vectors to disk in binary format

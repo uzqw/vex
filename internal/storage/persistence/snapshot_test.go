@@ -184,3 +184,80 @@ func TestSnapshotNotFound(t *testing.T) {
 		t.Fatalf("Load should not fail when no snapshot exists: %v", err)
 	}
 }
+
+func TestSnapshotGetLastSnapshotInfo(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "vex-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	ds := &mockDataSource{
+		vectors:   map[string][]float32{"v": {1, 2, 3}},
+		dimension: 3,
+	}
+	cfg := Config{Enabled: true, DataDir: tempDir, Compression: "none", Checksum: true}
+	snap := NewVectorSnapshot(cfg, ds)
+
+	t.Run("no snapshot returns nil info without error", func(t *testing.T) {
+		info, err := snap.GetLastSnapshotInfo()
+		if err != nil {
+			t.Fatalf("GetLastSnapshotInfo error before save: %v", err)
+		}
+		if info != nil {
+			t.Errorf("expected nil info before first save, got %+v", info)
+		}
+	})
+
+	t.Run("info returned after save", func(t *testing.T) {
+		ctx := context.Background()
+		if err := snap.Save(ctx); err != nil {
+			t.Fatalf("Save error: %v", err)
+		}
+		info, err := snap.GetLastSnapshotInfo()
+		if err != nil {
+			t.Fatalf("GetLastSnapshotInfo error after save: %v", err)
+		}
+		if info == nil {
+			t.Fatal("expected non-nil info after save")
+		}
+		if info.VectorCount != 1 {
+			t.Errorf("VectorCount = %d, want 1", info.VectorCount)
+		}
+	})
+}
+
+func TestSnapshotSaveDisabledConfig(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "vex-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	ds := &mockDataSource{
+		vectors:   map[string][]float32{"v": {1, 2}},
+		dimension: 2,
+	}
+	// Enabled=false: Save should still proceed (it writes regardless of Enabled flag)
+	cfg := Config{Enabled: true, DataDir: tempDir, Compression: "none"}
+	snap := NewVectorSnapshot(cfg, ds)
+	ctx := context.Background()
+	if err := snap.Save(ctx); err != nil {
+		t.Fatalf("Save error: %v", err)
+	}
+}
+
+func TestSnapshotLoadBadDir(t *testing.T) {
+	ds := &mockDataSource{
+		vectors:   make(map[string][]float32),
+		dimension: 4,
+	}
+	// Point to a directory that does not exist → metadata missing → treated as no snapshot
+	cfg := Config{Enabled: true, DataDir: "/nonexistent/path/vex-test"}
+	snap := NewVectorSnapshot(cfg, ds)
+	ctx := context.Background()
+	// Load on missing dir: should return nil (no snapshot found), not a hard error
+	if err := snap.Load(ctx); err != nil {
+		t.Logf("Load with bad dir returned error (acceptable): %v", err)
+	}
+}

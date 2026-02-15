@@ -31,6 +31,7 @@ type HNSWNode struct {
 	Vector    []float32
 	Level     int               // Node's layer level (0 = bottom layer)
 	Neighbors [][]*HNSWNeighbor // Multi-layer neighbor lists: neighbors[layer] = [neighbor1, neighbor2, ...]
+	deleted   bool              // tombstone: set in Delete, checked during traversal
 }
 
 // HNSWNeighbor represents a link to another node with precomputed distance
@@ -287,21 +288,22 @@ func (h *HNSWIndex) searchLayer(query []float32, entryPoint *HNSWNode, layer int
 
 		if current.node.Level >= layer {
 			for _, neighbor := range current.node.Neighbors[layer] {
-				if visited[neighbor.Node] {
+				nb := neighbor.Node
+				if visited[nb] || nb.deleted {
 					continue
 				}
-				visited[neighbor.Node] = true
-				d, _ := distanceBetween(query, neighbor.Node.Vector)
+				visited[nb] = true
+				d, _ := distanceBetween(query, nb.Vector)
 
 				if d < W[0].distance || len(W) < ef {
-					heap.Push(&C, &candidate{node: neighbor.Node, distance: d})
-					heap.Push(&W, &candidate{node: neighbor.Node, distance: d})
+					heap.Push(&C, &candidate{node: nb, distance: d})
+					heap.Push(&W, &candidate{node: nb, distance: d})
 					if len(W) > ef {
 						heap.Pop(&W)
 					}
 					if d < bestDist {
 						bestDist = d
-						best = neighbor.Node
+						best = nb
 					}
 				}
 			}
@@ -334,15 +336,16 @@ func (h *HNSWIndex) searchLayerWithEf(query []float32, entryPoint *HNSWNode, lay
 
 		if current.node.Level >= layer {
 			for _, neighbor := range current.node.Neighbors[layer] {
-				if visited[neighbor.Node] {
+				nb := neighbor.Node
+				if visited[nb] || nb.deleted {
 					continue
 				}
-				visited[neighbor.Node] = true
-				d, _ := distanceBetween(query, neighbor.Node.Vector)
+				visited[nb] = true
+				d, _ := distanceBetween(query, nb.Vector)
 
 				if d < W[0].distance || len(W) < ef {
-					heap.Push(&C, &candidate{node: neighbor.Node, distance: d})
-					heap.Push(&W, &candidate{node: neighbor.Node, distance: d})
+					heap.Push(&C, &candidate{node: nb, distance: d})
+					heap.Push(&W, &candidate{node: nb, distance: d})
 					if len(W) > ef {
 						heap.Pop(&W) // evict furthest
 					}
@@ -351,10 +354,16 @@ func (h *HNSWIndex) searchLayerWithEf(query []float32, entryPoint *HNSWNode, lay
 		}
 	}
 
-	// Drain W into a slice sorted closest-first
-	result := make([]*HNSWNode, len(W))
+	// Drain W into a slice sorted closest-first, skipping any tombstoned nodes
+	result := make([]*HNSWNode, 0, len(W))
+	tmp := make([]*HNSWNode, len(W))
 	for i := len(W) - 1; i >= 0; i-- {
-		result[i] = heap.Pop(&W).(*candidate).node
+		tmp[i] = heap.Pop(&W).(*candidate).node
+	}
+	for _, n := range tmp {
+		if !n.deleted {
+			result = append(result, n)
+		}
 	}
 	return result
 }
@@ -444,6 +453,9 @@ func (h *HNSWIndex) Delete(key string) error {
 	if !exists {
 		return fmt.Errorf("vector with key %q not found", key)
 	}
+
+	// Mark as deleted so concurrent/future traversals skip it immediately
+	node.deleted = true
 
 	// fix 6: remove this node from every neighbor's adjacency list
 	for layer := 0; layer <= node.Level; layer++ {

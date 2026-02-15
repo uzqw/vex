@@ -207,6 +207,52 @@ func TestStorageConcurrency(t *testing.T) {
 	wg.Wait()
 }
 
+func TestStorageGetAllKeys(t *testing.T) {
+	t.Run("empty storage returns empty slice", func(t *testing.T) {
+		s := New()
+		keys := s.GetAllKeys()
+		if len(keys) != 0 {
+			t.Errorf("GetAllKeys() = %d keys, want 0", len(keys))
+		}
+	})
+
+	t.Run("returns all inserted keys", func(t *testing.T) {
+		s := New()
+		_ = s.Set("alpha", []float32{1, 0, 0})
+		_ = s.Set("beta", []float32{0, 1, 0})
+		_ = s.Set("gamma", []float32{0, 0, 1})
+
+		keys := s.GetAllKeys()
+		if len(keys) != 3 {
+			t.Errorf("GetAllKeys() = %d keys, want 3", len(keys))
+		}
+		seen := make(map[string]bool)
+		for _, k := range keys {
+			seen[k] = true
+		}
+		for _, want := range []string{"alpha", "beta", "gamma"} {
+			if !seen[want] {
+				t.Errorf("key %q missing from GetAllKeys()", want)
+			}
+		}
+	})
+
+	t.Run("deleted keys not returned", func(t *testing.T) {
+		s := New()
+		_ = s.Set("keep", []float32{1, 0, 0})
+		_ = s.Set("drop", []float32{0, 1, 0})
+		s.Delete("drop")
+
+		keys := s.GetAllKeys()
+		if len(keys) != 1 {
+			t.Errorf("GetAllKeys() = %d keys after delete, want 1", len(keys))
+		}
+		if keys[0] != "keep" {
+			t.Errorf("GetAllKeys() = %v, want [keep]", keys)
+		}
+	})
+}
+
 func BenchmarkStorageSet(b *testing.B) {
 	s := New()
 	vec := make([]float32, 128)
