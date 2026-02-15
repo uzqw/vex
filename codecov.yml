@@ -19,7 +19,7 @@ ignore:
   # Test files themselves
   - "**/*_test.go"
   # Assembly stubs — not instrumentable by Go's coverage tool
-  - "internal/vector/asm/**/*"
+  - "internal/vector/asm"
 
 comment:
   layout: "reach,diff,flags,files"
