@@ -294,6 +294,55 @@ func BenchmarkIndexSearch_Comparison_1024D_50K(b *testing.B) {
 	})
 }
 
+// benchmarkIndexSearchComparison compares both algorithms using the same vectors.
+func benchmarkIndexSearchComparison(b *testing.B, dim, datasetSize int) {
+	b.Helper()
+
+	vectors := make([][]float32, datasetSize)
+	for i := 0; i < datasetSize; i++ {
+		vectors[i] = generateRandomVector(dim)
+	}
+	queryVec := generateRandomVector(dim)
+
+	b.Run("BruteForce", func(b *testing.B) {
+		index := storage.NewBruteForceIndex()
+		for i := 0; i < datasetSize; i++ {
+			_ = index.Insert(fmt.Sprintf("vec:%d", i), vectors[i])
+		}
+
+		b.ResetTimer()
+		b.ReportAllocs()
+
+		for i := 0; i < b.N; i++ {
+			_, _ = index.Search(queryVec, 10)
+		}
+	})
+
+	b.Run("HNSW", func(b *testing.B) {
+		index := storage.NewHNSWIndex()
+		for i := 0; i < datasetSize; i++ {
+			_ = index.Insert(fmt.Sprintf("vec:%d", i), vectors[i])
+		}
+
+		b.ResetTimer()
+		b.ReportAllocs()
+
+		for i := 0; i < b.N; i++ {
+			_, _ = index.Search(queryVec, 10)
+		}
+	})
+}
+
+// BenchmarkIndexSearch_Comparison_1024D_10K compares both algorithms on 1024D with 10k vectors.
+func BenchmarkIndexSearch_Comparison_1024D_10K(b *testing.B) {
+	benchmarkIndexSearchComparison(b, 1024, 10000)
+}
+
+// BenchmarkIndexSearch_Comparison_1536D_10K compares both algorithms on 1536D with 10k vectors.
+func BenchmarkIndexSearch_Comparison_1536D_10K(b *testing.B) {
+	benchmarkIndexSearchComparison(b, 1536, 10000)
+}
+
 // BenchmarkIndexMemoryUsage compares memory usage between algorithms
 func BenchmarkIndexMemoryUsage(b *testing.B) {
 	dim := 1024

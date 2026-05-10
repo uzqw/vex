@@ -276,6 +276,54 @@ func TestHNSWRecallAccuracy(t *testing.T) {
 	}
 }
 
+// TestHNSWRecallAt10HighDimension verifies recall@10 for production-like dimensions.
+func TestHNSWRecallAt10HighDimension(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping high-dimension recall tests in short mode")
+	}
+
+	configs := []RecallTestConfig{
+		{Name: "10K-1024D", Vectors: 10000, Dimension: 1024, KValues: []int{10}, NumQueries: 100, Seed: DefaultSeed},
+		{Name: "10K-1536D", Vectors: 10000, Dimension: 1536, KValues: []int{10}, NumQueries: 100, Seed: DefaultSeed},
+	}
+
+	const minRecallAt10 = 0.90
+
+	for _, config := range configs {
+		t.Run(config.Name, func(t *testing.T) {
+			hnsw, bruteForce, _, err := buildTestIndices(config.Vectors, config.Dimension, config.Seed)
+			if err != nil {
+				t.Fatalf("failed to build indices: %v", err)
+			}
+
+			queryRng := rand.New(rand.NewSource(config.Seed + QuerySeedOffset))
+			var totalRecall float64
+			for q := 0; q < config.NumQueries; q++ {
+				// Query vectors use a separate deterministic seed; they are not reused inserted vectors.
+				queryVec := generateTestVector(config.Dimension, queryRng)
+
+				hnswResults, err := hnsw.Search(queryVec, 10)
+				if err != nil {
+					t.Fatalf("HNSW search failed: %v", err)
+				}
+				bruteForceResults, err := bruteForce.Search(queryVec, 10)
+				if err != nil {
+					t.Fatalf("BruteForce search failed: %v", err)
+				}
+
+				totalRecall += calculateRecallAtK(hnswResults, bruteForceResults, 10)
+			}
+
+			avgRecall := totalRecall / float64(config.NumQueries)
+			t.Logf("%d vectors, %d dims, %d queries, recall@10 = %.2f%%",
+				config.Vectors, config.Dimension, config.NumQueries, avgRecall*100)
+			if avgRecall < minRecallAt10 {
+				t.Fatalf("recall@10 = %.4f is below threshold %.2f", avgRecall, minRecallAt10)
+			}
+		})
+	}
+}
+
 // TestHNSWRecallReport generates a detailed recall accuracy report
 func TestHNSWRecallReport(t *testing.T) {
 	if testing.Short() {

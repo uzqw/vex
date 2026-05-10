@@ -76,37 +76,10 @@ func TestAdaptiveEf(t *testing.T) {
 	h := NewHNSWIndex()
 	base := h.EfConstruct
 
-	cases := []struct {
-		dim     int
-		wantMax int // result must be <= wantMax
-		wantMin int // result must be >= wantMin
-	}{
-		{64, base, h.M * 2},  // dim < 128: no scaling
-		{128, base, base},    // dim == 128: no scaling
-		{256, base, h.M * 2}, // dim > 128: scaled down
-		{512, base, h.M * 2},
-	}
-
-	for _, tc := range cases {
-		got := h.adaptiveEf(base, tc.dim)
-		if got > tc.wantMax {
-			t.Errorf("adaptiveEf(dim=%d) = %d > max %d", tc.dim, got, tc.wantMax)
+	for _, dim := range []int{64, 128, 256, 512, 1024, 1536} {
+		if got := h.adaptiveEf(base, dim); got != base {
+			t.Errorf("adaptiveEf(dim=%d) = %d, want %d", dim, got, base)
 		}
-		if got < tc.wantMin {
-			t.Errorf("adaptiveEf(dim=%d) = %d < min %d", tc.dim, got, tc.wantMin)
-		}
-	}
-
-	// 128-D should return baseEf unchanged
-	if h.adaptiveEf(base, 128) != base {
-		t.Errorf("adaptiveEf(128) = %d, want %d", h.adaptiveEf(base, 128), base)
-	}
-
-	// 512-D should be strictly less than 256-D result
-	ef512 := h.adaptiveEf(base, 512)
-	ef256 := h.adaptiveEf(base, 256)
-	if ef512 >= ef256 {
-		t.Errorf("adaptiveEf(512)=%d should be < adaptiveEf(256)=%d", ef512, ef256)
 	}
 }
 

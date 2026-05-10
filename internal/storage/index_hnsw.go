@@ -165,8 +165,8 @@ type HNSWConfig struct {
 
 const (
 	DefaultHNSWM           = 16
-	DefaultHNSWEfConstruct = 128
-	DefaultHNSWEf          = 64
+	DefaultHNSWEfConstruct = 600
+	DefaultHNSWEf          = 600
 )
 
 // DefaultHNSWConfig returns the default HNSW configuration.
@@ -221,23 +221,10 @@ func (h *HNSWIndex) assignLevel() int {
 	return int(-math.Log(h.rng.Float64()) * float64(h.levelMult))
 }
 
-// adaptiveEf scales the beam width down for high-dimensional vectors.
-// Cost of searchLayerWithEf grows as O(ef * M * dim), so holding ef fixed
-// at the 128-D baseline makes 512-D ~4× more expensive for the same recall.
-// Scaling by 1/sqrt(dim/refDim) keeps construction time roughly constant
-// across dimensions while preserving recall (high-dim neighbor distributions
-// are more uniform, so a smaller ef still covers the relevant region).
+// adaptiveEf is currently a pass-through. Earlier versions scaled ef down for
+// high-dimensional vectors, but that hurt recall@10 on 1024D/1536D workloads.
 func (h *HNSWIndex) adaptiveEf(baseEf, dim int) int {
-	const refDim = 128
-	if dim <= refDim {
-		return baseEf
-	}
-	ef := int(float64(baseEf) / math.Sqrt(float64(dim)/refDim))
-	minEf := h.M * 2 // never go below 2*M
-	if ef < minEf {
-		ef = minEf
-	}
-	return ef
+	return baseEf
 }
 
 // distanceBetween computes distance between two vectors
