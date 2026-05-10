@@ -10,7 +10,7 @@ A Go vector database focused on fast in-memory vector storage, RESP-compatible c
 ## Features
 
 - **SIMD-Optimized Dot Products**: AVX2/AVX512 assembly on supported AMD64 CPUs, pure Go fallback otherwise
-- **Optional HNSW Index**: Hierarchical Navigable Small World search via `-index=hnsw`; default search remains sharded full scan
+- **Optional HNSW Index**: Hierarchical Navigable Small World search via `-index=hnsw`; `-index=auto` keeps small searches on sharded full scan
 - **Snapshot Persistence**: RDB-style persistence with compression and automatic scheduling
 - **High-Performance Storage**: 32-way sharded in-memory storage with lock-free metrics
 - **RESP Protocol**: Compatible with Redis protocol for easy integration
@@ -45,6 +45,9 @@ make run
 
 # Run with HNSW search index enabled
 go run ./cmd/vex-server/main.go -index=hnsw
+
+# Run with automatic search selection
+go run ./cmd/vex-server/main.go -index=auto
 
 # Run with JSON logging
 make run-json
@@ -394,12 +397,19 @@ make test-coverage
 
 - `-host` - Host to bind to (default: "0.0.0.0")
 - `-port` - Port to listen on (default: "6379")
-- `-index` - Search index: "none", "bruteforce", or "hnsw" (default: "none")
+- `-index` - Search index: "none", "bruteforce", "hnsw", or "auto" (default: "none")
+- `-auto-index-min-vectors` - Minimum vector count before auto mode uses HNSW (default: 10000)
+- `-hnsw-m` - HNSW max neighbors per upper layer (default: 16)
+- `-hnsw-ef` - HNSW search beam width (default: 64)
+- `-hnsw-ef-construction` - HNSW construction beam width (default: 128)
+- `-hnsw-seed` - HNSW random seed; 0 uses a random seed (default: 0)
 - `-log-format` - Log format: "text" or "json" (default: "text")
 - `-log-level` - Log level: "debug", "info", "warn", "error" (default: "info")
 
-Use `-index=hnsw` to route `VSEARCH` through the HNSW index. The default `none`
-keeps the original sharded full-scan search path.
+Use `-index=hnsw` to route `VSEARCH` through the HNSW index. Use `-index=auto`
+to keep small datasets on sharded full-scan search and switch to HNSW above
+`-auto-index-min-vectors`. The default `none` keeps the original sharded
+full-scan search path.
 
 ### Persistence Configuration
 

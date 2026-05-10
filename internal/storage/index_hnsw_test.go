@@ -48,6 +48,28 @@ func TestNewHNSWIndex(t *testing.T) {
 	}
 }
 
+func TestNewHNSWIndexWithConfig(t *testing.T) {
+	h := NewHNSWIndexWithConfig(HNSWConfig{
+		M:           12,
+		EfConstruct: 80,
+		Ef:          40,
+		Seed:        123,
+	})
+
+	if h.M != 12 {
+		t.Errorf("M = %d, want 12", h.M)
+	}
+	if h.EfConstruct != 80 {
+		t.Errorf("EfConstruct = %d, want 80", h.EfConstruct)
+	}
+	if h.Ef != 40 {
+		t.Errorf("Ef = %d, want 40", h.Ef)
+	}
+	if h.rng == nil {
+		t.Fatal("rng is nil")
+	}
+}
+
 // ---- adaptiveEf -------------------------------------------------------------
 
 func TestAdaptiveEf(t *testing.T) {

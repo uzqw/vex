@@ -131,6 +131,28 @@ go run ./cmd/vex-benchmark/main.go \
   -dim=256
 ```
 
+### Comparing Search Modes
+
+Run the server with the search mode you want to test, then run the same
+benchmark command against each mode:
+
+```bash
+# Terminal 1
+go run ./cmd/vex-server/main.go -index=auto
+
+# Terminal 2
+go run ./cmd/vex-benchmark/main.go \
+  -mode=search -concurrency=8 -n=10000 -dim=128 \
+  -prepare-n=10000 -warmup=1000 -k=10
+```
+
+Available server search modes:
+
+- `-index=none`: sharded full-scan storage search
+- `-index=bruteforce`: brute-force index search
+- `-index=hnsw`: HNSW index search
+- `-index=auto`: sharded full scan below `-auto-index-min-vectors`, HNSW above it
+
 ### Benchmark Flags
 
 - `-host`: Server host (default: "localhost")

@@ -15,7 +15,6 @@
 package storage
 
 import (
-	"container/heap"
 	"fmt"
 	"math"
 	"math/rand"
@@ -47,36 +46,98 @@ type candidate struct {
 
 // maxHeap is a max-heap: the furthest (worst) candidate is at the top.
 // Used for W (working set) to efficiently track the worst result and evict it.
-type maxHeap []*candidate
+type maxHeap []candidate
 
-func (h maxHeap) Len() int           { return len(h) }
-func (h maxHeap) Less(i, j int) bool { return h[i].distance > h[j].distance }
-func (h maxHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *maxHeap) push(x candidate) {
+	*h = append(*h, x)
+	for child := len(*h) - 1; child > 0; {
+		parent := (child - 1) / 2
+		if (*h)[parent].distance >= (*h)[child].distance {
+			break
+		}
+		(*h)[parent], (*h)[child] = (*h)[child], (*h)[parent]
+		child = parent
+	}
+}
 
-func (h *maxHeap) Push(x interface{}) { *h = append(*h, x.(*candidate)) }
-func (h *maxHeap) Pop() interface{} {
+func (h *maxHeap) pop() candidate {
 	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[0 : n-1]
-	return x
+	root := old[0]
+	last := old[len(old)-1]
+	old = old[:len(old)-1]
+	if len(old) > 0 {
+		old[0] = last
+		siftDownMax(old, 0)
+	}
+	*h = old
+	return root
+}
+
+func siftDownMax(h maxHeap, parent int) {
+	for {
+		left := parent*2 + 1
+		if left >= len(h) {
+			return
+		}
+		best := left
+		right := left + 1
+		if right < len(h) && h[right].distance > h[left].distance {
+			best = right
+		}
+		if h[parent].distance >= h[best].distance {
+			return
+		}
+		h[parent], h[best] = h[best], h[parent]
+		parent = best
+	}
 }
 
 // minHeap is a min-heap: the closest (best) candidate is at the top.
 // Used for C (candidate set) so we always expand the nearest unvisited node first.
-type minHeap []*candidate
+type minHeap []candidate
 
-func (h minHeap) Len() int           { return len(h) }
-func (h minHeap) Less(i, j int) bool { return h[i].distance < h[j].distance }
-func (h minHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *minHeap) push(x candidate) {
+	*h = append(*h, x)
+	for child := len(*h) - 1; child > 0; {
+		parent := (child - 1) / 2
+		if (*h)[parent].distance <= (*h)[child].distance {
+			break
+		}
+		(*h)[parent], (*h)[child] = (*h)[child], (*h)[parent]
+		child = parent
+	}
+}
 
-func (h *minHeap) Push(x interface{}) { *h = append(*h, x.(*candidate)) }
-func (h *minHeap) Pop() interface{} {
+func (h *minHeap) pop() candidate {
 	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[0 : n-1]
-	return x
+	root := old[0]
+	last := old[len(old)-1]
+	old = old[:len(old)-1]
+	if len(old) > 0 {
+		old[0] = last
+		siftDownMin(old, 0)
+	}
+	*h = old
+	return root
+}
+
+func siftDownMin(h minHeap, parent int) {
+	for {
+		left := parent*2 + 1
+		if left >= len(h) {
+			return
+		}
+		best := left
+		right := left + 1
+		if right < len(h) && h[right].distance < h[left].distance {
+			best = right
+		}
+		if h[parent].distance <= h[best].distance {
+			return
+		}
+		h[parent], h[best] = h[best], h[parent]
+		parent = best
+	}
 }
 
 // HNSWIndex implements Hierarchical Navigable Small World algorithm.
@@ -94,16 +155,63 @@ type HNSWIndex struct {
 	rng         *rand.Rand           // Per-index RNG, avoids global rand lock contention
 }
 
+// HNSWConfig controls HNSW graph density and search breadth.
+type HNSWConfig struct {
+	M           int
+	EfConstruct int
+	Ef          int
+	Seed        int64
+}
+
+const (
+	DefaultHNSWM           = 16
+	DefaultHNSWEfConstruct = 128
+	DefaultHNSWEf          = 64
+)
+
+// DefaultHNSWConfig returns the default HNSW configuration.
+func DefaultHNSWConfig() HNSWConfig {
+	return HNSWConfig{
+		M:           DefaultHNSWM,
+		EfConstruct: DefaultHNSWEfConstruct,
+		Ef:          DefaultHNSWEf,
+		Seed:        rand.Int63(),
+	}
+}
+
+func (c HNSWConfig) withDefaults() HNSWConfig {
+	defaults := DefaultHNSWConfig()
+	if c.M <= 0 {
+		c.M = defaults.M
+	}
+	if c.EfConstruct <= 0 {
+		c.EfConstruct = defaults.EfConstruct
+	}
+	if c.Ef <= 0 {
+		c.Ef = defaults.Ef
+	}
+	if c.Seed == 0 {
+		c.Seed = defaults.Seed
+	}
+	return c
+}
+
 // NewHNSWIndex creates a new HNSW index with default parameters
 func NewHNSWIndex() *HNSWIndex {
+	return NewHNSWIndexWithConfig(DefaultHNSWConfig())
+}
+
+// NewHNSWIndexWithConfig creates a new HNSW index with custom parameters.
+func NewHNSWIndexWithConfig(config HNSWConfig) *HNSWIndex {
+	config = config.withDefaults()
 	return &HNSWIndex{
 		nodes:       make(map[string]*HNSWNode),
 		maxLevel:    0,
 		levelMult:   float32(1.0 / math.Log(2.0)),
-		M:           32,                                     // Maximum neighbors per layer (layer > 0); layer 0 uses 2*M
-		EfConstruct: 600,                                    // Construction beam width
-		Ef:          600,                                    // Search beam width
-		rng:         rand.New(rand.NewSource(rand.Int63())), // fix 5: per-index RNG, no global lock
+		M:           config.M,           // Maximum neighbors per layer (layer > 0); layer 0 uses 2*M
+		EfConstruct: config.EfConstruct, // Construction beam width
+		Ef:          config.Ef,          // Search beam width
+		rng:         rand.New(rand.NewSource(config.Seed)),
 	}
 }
 
@@ -244,8 +352,13 @@ func (h *HNSWIndex) Search(query []float32, k int) ([]vector.SearchResult, error
 		currentNearest, _ = h.searchLayer(query, currentNearest, lc, 1)
 	}
 
-	// Search at layer 0 with ef parameter
-	candidates := h.searchLayerWithEf(query, currentNearest, 0, h.adaptiveEf(h.Ef, len(query)))
+	// Search at layer 0 with ef parameter. ef must cover k, otherwise
+	// recall@k is capped by the candidate list size.
+	searchEf := h.adaptiveEf(h.Ef, len(query))
+	if searchEf < k {
+		searchEf = k
+	}
+	candidates := h.searchLayerWithEf(query, currentNearest, 0, searchEf)
 
 	// Extract top-k results
 	results := make([]vector.SearchResult, 0, k)
@@ -266,12 +379,12 @@ func (h *HNSWIndex) Search(query []float32, k int) ([]vector.SearchResult, error
 // W (working set) is a max-heap so we can cheaply evict the worst result.
 func (h *HNSWIndex) searchLayer(query []float32, entryPoint *HNSWNode, layer int, ef int) (*HNSWNode, float32) {
 	visited := make(map[*HNSWNode]bool)
-	C := make(minHeap, 0) // candidates: min-heap, closest at top
-	W := make(maxHeap, 0) // working set: max-heap, furthest (worst) at top
+	C := make(minHeap, 0, ef) // candidates: min-heap, closest at top
+	W := make(maxHeap, 0, ef) // working set: max-heap, furthest (worst) at top
 
 	dist, _ := distanceBetween(query, entryPoint.Vector)
-	heap.Push(&C, &candidate{node: entryPoint, distance: dist})
-	heap.Push(&W, &candidate{node: entryPoint, distance: dist})
+	C.push(candidate{node: entryPoint, distance: dist})
+	W.push(candidate{node: entryPoint, distance: dist})
 	visited[entryPoint] = true
 
 	// fix 4: track best inline instead of scanning W at the end
@@ -284,7 +397,7 @@ func (h *HNSWIndex) searchLayer(query []float32, entryPoint *HNSWNode, layer int
 			break
 		}
 
-		current := heap.Pop(&C).(*candidate)
+		current := C.pop()
 
 		if current.node.Level >= layer {
 			for _, neighbor := range current.node.Neighbors[layer] {
@@ -296,10 +409,10 @@ func (h *HNSWIndex) searchLayer(query []float32, entryPoint *HNSWNode, layer int
 				d, _ := distanceBetween(query, nb.Vector)
 
 				if d < W[0].distance || len(W) < ef {
-					heap.Push(&C, &candidate{node: nb, distance: d})
-					heap.Push(&W, &candidate{node: nb, distance: d})
+					C.push(candidate{node: nb, distance: d})
+					W.push(candidate{node: nb, distance: d})
 					if len(W) > ef {
-						heap.Pop(&W)
+						W.pop()
 					}
 					if d < bestDist {
 						bestDist = d
@@ -317,12 +430,12 @@ func (h *HNSWIndex) searchLayer(query []float32, entryPoint *HNSWNode, layer int
 // C (candidates) is a min-heap; W (working set) is a max-heap.
 func (h *HNSWIndex) searchLayerWithEf(query []float32, entryPoint *HNSWNode, layer int, ef int) []*HNSWNode {
 	visited := make(map[*HNSWNode]bool)
-	C := make(minHeap, 0) // candidates: min-heap
-	W := make(maxHeap, 0) // working set: max-heap
+	C := make(minHeap, 0, ef) // candidates: min-heap
+	W := make(maxHeap, 0, ef) // working set: max-heap
 
 	dist, _ := distanceBetween(query, entryPoint.Vector)
-	heap.Push(&C, &candidate{node: entryPoint, distance: dist})
-	heap.Push(&W, &candidate{node: entryPoint, distance: dist})
+	C.push(candidate{node: entryPoint, distance: dist})
+	W.push(candidate{node: entryPoint, distance: dist})
 	visited[entryPoint] = true
 
 	for len(C) > 0 {
@@ -332,7 +445,7 @@ func (h *HNSWIndex) searchLayerWithEf(query []float32, entryPoint *HNSWNode, lay
 			break // no candidate can improve W
 		}
 
-		current := heap.Pop(&C).(*candidate)
+		current := C.pop()
 
 		if current.node.Level >= layer {
 			for _, neighbor := range current.node.Neighbors[layer] {
@@ -344,28 +457,27 @@ func (h *HNSWIndex) searchLayerWithEf(query []float32, entryPoint *HNSWNode, lay
 				d, _ := distanceBetween(query, nb.Vector)
 
 				if d < W[0].distance || len(W) < ef {
-					heap.Push(&C, &candidate{node: nb, distance: d})
-					heap.Push(&W, &candidate{node: nb, distance: d})
+					C.push(candidate{node: nb, distance: d})
+					W.push(candidate{node: nb, distance: d})
 					if len(W) > ef {
-						heap.Pop(&W) // evict furthest
+						W.pop() // evict furthest
 					}
 				}
 			}
 		}
 	}
 
-	// Drain W into a slice sorted closest-first, skipping any tombstoned nodes
-	result := make([]*HNSWNode, 0, len(W))
-	tmp := make([]*HNSWNode, len(W))
+	// Drain W into a slice sorted closest-first, skipping any tombstoned nodes.
+	result := make([]*HNSWNode, len(W))
+	write := len(W)
 	for i := len(W) - 1; i >= 0; i-- {
-		tmp[i] = heap.Pop(&W).(*candidate).node
-	}
-	for _, n := range tmp {
+		n := W.pop().node
 		if !n.deleted {
-			result = append(result, n)
+			write--
+			result[write] = n
 		}
 	}
-	return result
+	return result[write:]
 }
 
 // selectNeighborsHeuristic implements HNSW paper Algorithm 4.

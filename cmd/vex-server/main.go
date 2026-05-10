@@ -48,7 +48,12 @@ var (
 	port      = flag.String("port", defaultPort, "Port to listen on")
 	logFormat = flag.String("log-format", "text", "Log format: text or json")
 	logLevel  = flag.String("log-level", "info", "Log level: debug, info, warn, error")
-	indexMode = flag.String("index", "none", "Search index: none, bruteforce, or hnsw")
+	indexMode = flag.String("index", "none", "Search index: none, bruteforce, hnsw, or auto")
+	autoMin   = flag.Int("auto-index-min-vectors", 10000, "Minimum vector count before auto mode uses HNSW search")
+	hnswM     = flag.Int("hnsw-m", storage.DefaultHNSWM, "HNSW max neighbors per upper layer")
+	hnswEf    = flag.Int("hnsw-ef", storage.DefaultHNSWEf, "HNSW search beam width")
+	hnswEfC   = flag.Int("hnsw-ef-construction", storage.DefaultHNSWEfConstruct, "HNSW construction beam width")
+	hnswSeed  = flag.Int64("hnsw-seed", 0, "HNSW RNG seed (0 uses random seed)")
 	showVer   = flag.Bool("version", false, "Show version and exit")
 	store     *storage.Storage
 	index     storage.Index
@@ -112,10 +117,15 @@ func init() {
 		index = nil
 	case "bruteforce":
 		index = storage.NewBruteForceIndex()
-	case "hnsw":
-		index = storage.NewHNSWIndex()
+	case "hnsw", "auto":
+		index = storage.NewHNSWIndexWithConfig(storage.HNSWConfig{
+			M:           *hnswM,
+			EfConstruct: *hnswEfC,
+			Ef:          *hnswEf,
+			Seed:        *hnswSeed,
+		})
 	default:
-		fmt.Fprintf(os.Stderr, "invalid -index value %q; expected none, bruteforce, or hnsw\n", *indexMode)
+		fmt.Fprintf(os.Stderr, "invalid -index value %q; expected none, bruteforce, hnsw, or auto\n", *indexMode)
 		os.Exit(2)
 	}
 }
@@ -323,7 +333,11 @@ func handleVSet(log *logger.Logger, writer *protocol.RESPWriter, cmd []string) {
 		return
 	}
 
-	if index != nil {
+	useIndex := index != nil
+	if strings.EqualFold(*indexMode, "auto") && store.Count() < *autoMin {
+		useIndex = false
+	}
+	if useIndex {
 		normalized, ok := store.Get(key)
 		if !ok {
 			_ = writer.WriteError("failed to read normalized vector after set")
