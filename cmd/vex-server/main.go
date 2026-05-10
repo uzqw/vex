@@ -416,9 +416,9 @@ func handleVSearch(log *logger.Logger, writer *protocol.RESPWriter, cmd []string
 
 	var results []vector.SearchResult
 	if index != nil {
-		normalizedQuery, err := vector.Normalize(query)
-		if err != nil {
-			_ = writer.WriteError(fmt.Sprintf("failed to normalize query: %s", err.Error()))
+		normalizedQuery, normalizeErr := vector.Normalize(query)
+		if normalizeErr != nil {
+			_ = writer.WriteError(fmt.Sprintf("failed to normalize query: %s", normalizeErr.Error()))
 			return
 		}
 		results, err = index.Search(normalizedQuery, k)
