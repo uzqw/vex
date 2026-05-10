@@ -132,6 +132,28 @@ func TestDotProductNormalized(t *testing.T) {
 	}
 }
 
+func TestDotProductUsesSelectedImplementation(t *testing.T) {
+	original := dotProductImplementation
+	defer func() { dotProductImplementation = original }()
+
+	called := false
+	dotProductImplementation = func(a, b []float32) float32 {
+		called = true
+		return 42
+	}
+
+	got, err := DotProduct([]float32{1, 2}, []float32{3, 4})
+	if err != nil {
+		t.Fatalf("DotProduct() error = %v", err)
+	}
+	if !called {
+		t.Fatal("DotProduct() did not call selected implementation")
+	}
+	if got != 42 {
+		t.Fatalf("DotProduct() = %v, want selected implementation result 42", got)
+	}
+}
+
 // Benchmark: Go implementation
 func BenchmarkDotProductGo(b *testing.B) {
 	dims := []int{8, 16, 32, 64, 128, 256, 512, 1024}

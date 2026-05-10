@@ -5,26 +5,26 @@
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-A production-grade, high-performance vector database built with Go. Features SIMD-optimized operations (7.8x-9.1x speedup), HNSW indexing for fast approximate search, and RDB-style snapshot persistence. Designed for real-world embedding workloads (768D-2048D dimensions).
+A Go vector database focused on fast in-memory vector storage, RESP-compatible commands, optional HNSW search, and snapshot persistence. It includes SIMD-accelerated dot products on supported AMD64 CPUs, with pure Go fallback elsewhere.
 
 ## Features
 
-- **SIMD-Optimized Vector Operations**: 7.8x-9.1x speedup with AVX2/AVX512 assembly for production dimensions
-- **HNSW Index**: Hierarchical Navigable Small World algorithm for fast approximate nearest neighbor search
+- **SIMD-Optimized Dot Products**: AVX2/AVX512 assembly on supported AMD64 CPUs, pure Go fallback otherwise
+- **Optional HNSW Index**: Hierarchical Navigable Small World search via `-index=hnsw`; default search remains sharded full scan
 - **Snapshot Persistence**: RDB-style persistence with compression and automatic scheduling
 - **High-Performance Storage**: 32-way sharded in-memory storage with lock-free metrics
 - **RESP Protocol**: Compatible with Redis protocol for easy integration
 - **Observability**: Built-in metrics, structured logging, and request tracing
-- **Production-Ready**: Graceful shutdown, automatic snapshots, comprehensive error handling
+- **Operational Features**: Graceful shutdown, automatic snapshots, structured logging, and error handling
 
 ## Architecture Highlights
 
-- **SIMD Assembly Optimizations**: AVX2/AVX512 instructions for 7.8x-9.1x faster dot products (768D-2048D)
-- **HNSW Algorithm**: Multi-layer hierarchical graph for O(log N) search complexity
+- **SIMD Assembly Optimizations**: AVX2/AVX512 instructions for dot products on supported AMD64 CPUs
+- **HNSW Algorithm**: Optional multi-layer graph index for approximate search
 - **Snapshot Persistence**: Atomic RDB-style snapshots with Snappy compression
 - **32-way Sharding**: Reduces lock contention with CPU cache-line padding
 - **Optimized Vector Search**: Normalized vectors enable dot-product computation for cosine similarity
-- **Production Features**: Graceful shutdown, automatic snapshots, memory monitoring
+- **Operational Features**: Graceful shutdown, automatic snapshots, memory monitoring
 
 ## Prerequisites
 
@@ -433,25 +433,34 @@ VEX_PERSISTENCE_ENABLED=true VEX_SNAPSHOT_SECONDS=600 ./vex-server
 
 ### Vector Operations (SIMD-Optimized)
 
-| Dimension | Speedup | Use Case |
-|-----------|---------|----------|
-| 768D      | 7.8x ⚡⚡⚡ | BERT, sentence transformers |
-| 1024D     | 8.5x ⚡⚡⚡⚡ | CLIP, ResNet image embeddings |
-| 1536D     | **9.1x** ⚡⚡⚡⚡ | OpenAI text-embedding-ada-002 |
-| 2048D     | 9.0x ⚡⚡⚡⚡ | Large multi-modal models |
+`vector.DotProduct` selects the best available implementation at runtime:
+AVX512, AVX2, then pure Go fallback. The speedup depends heavily on CPU
+features, vector dimension, and frequency scaling, so benchmark on the target
+machine before quoting performance:
 
-*Tested on Intel Core Ultra 9 285H with AVX2 support*
+```bash
+go test -run='^$' -bench=BenchmarkDotProductComparison -benchmem ./internal/vector
+go test -tags=noasm -run='^$' -bench=BenchmarkDotProduct -benchmem ./internal/vector
+```
 
-See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for detailed benchmarks.
+See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the SIMD implementation notes.
 
 ### System Performance
 
-- **Throughput**: 80,000+ QPS for inserts on modern hardware
-- **Search Latency**: P99 < 2ms with HNSW index
-- **Concurrency**: Scales linearly with CPU cores (32-way sharding)
-- **Memory**: ~4 bytes per dimension per vector (float32)
-- **Snapshot Save**: ~10s for 1M vectors (1024D, compressed)
-- **Snapshot Load**: ~50s for 1M vectors (1024D, compressed)
+End-to-end QPS and latency depend on CPU, dimension, dataset size, concurrency,
+index mode, and snapshot settings. Use the bundled benchmark tool to measure your
+target workload instead of relying on fixed headline numbers:
+
+```bash
+go run ./cmd/vex-benchmark/main.go \
+  -mode=search -concurrency=50 -n=100000 -dim=768 \
+  -prepare-n=50000 -warmup=5000 -k=10
+```
+
+- **Search modes**: default sharded full scan, optional brute-force index, optional HNSW index
+- **Concurrency**: 32-way sharded storage reduces lock contention for writes and direct storage reads
+- **Memory**: vectors are stored as float32 values (~4 bytes per dimension before Go/map/index overhead)
+- **SIMD**: dot-product calls use the selected AVX2/AVX512 implementation when available
 
 ## Use Cases
 

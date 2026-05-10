@@ -62,11 +62,7 @@ func DotProduct(a, b []float32) (float32, error) {
 		return 0, ErrDimensionMismatch
 	}
 
-	var sum float32
-	for i := range a {
-		sum += a[i] * b[i]
-	}
-	return sum, nil
+	return dotProductImplementation(a, b), nil
 }
 
 // CosineSimilarity calculates the cosine similarity between two vectors

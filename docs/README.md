@@ -45,18 +45,14 @@ goat ../c/dot_avx256_amd64.c -O3 -mavx2 -mfma
 
 ## Performance Summary
 
-Vex achieves **7.8x-9.1x performance improvement** for production-scale vector operations using SIMD assembly:
+Vex includes SIMD assembly for dot products on supported AMD64 CPUs. Runtime
+speedup depends on CPU features, vector dimension, and thermal/frequency state,
+so measure on the target machine before publishing performance numbers:
 
-| Dimension | Speedup | Use Case |
-|-----------|---------|----------|
-| 768D      | 7.8x    | BERT, sentence transformers |
-| 1024D     | 8.5x    | CLIP, ResNet image embeddings |
-| 1536D     | 9.1x    | OpenAI text-embedding-ada-002 |
-| 2048D     | 9.0x    | Large multi-modal models |
-
-*Tested on Intel Core Ultra 9 285H with AVX2 support*
-
-**Note**: Performance optimizations target production embedding dimensions (768D+). Lower dimensions are supported but rarely used in real-world applications.
+```bash
+go test -run='^$' -bench=BenchmarkDotProductComparison -benchmem ./internal/vector
+go test -tags=noasm -run='^$' -bench=BenchmarkDotProduct -benchmem ./internal/vector
+```
 
 ## Project Structure
 
