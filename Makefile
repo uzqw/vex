@@ -76,10 +76,12 @@ bench-all: bench-unit
 # Run unit benchmarks (micro-level performance tests)
 bench-unit:
 	@echo "Running unit benchmarks..."
-	$(GOTEST) -bench=. -benchmem -benchtime=3s ./benchmarks/...
+	$(GOTEST) -run='^$$' -bench=. -benchmem -benchtime=3s ./benchmarks/...
 
 # Run storage benchmarks specifically
-bench-storage: bench-unit
+bench-storage:
+	@echo "Running storage benchmarks..."
+	$(GOTEST) -run='^$$' -bench=. -benchmem -benchtime=3s ./benchmarks/storage/
 
 # Integration benchmarks (requires running server)
 bench-integration:
@@ -92,7 +94,7 @@ bench-integration:
 # Run custom benchmark
 benchmark-custom:
 	@echo "Running custom benchmark..."
-	@echo "Usage: make benchmark-custom ARGS='-mode=insert -concurrency=100 -n=200000'"
+	@echo "Usage: make benchmark-custom ARGS='-mode=search -concurrency=100 -n=200000 -prepare-n=100000 -k=10'"
 	$(GORUN) ./cmd/vex-benchmark/main.go $(ARGS)
 
 # Run tests

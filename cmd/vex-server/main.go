@@ -34,6 +34,7 @@ import (
 	"github.com/uzqw/vex/internal/metrics"
 	"github.com/uzqw/vex/internal/protocol"
 	"github.com/uzqw/vex/internal/storage"
+	"github.com/uzqw/vex/internal/vector"
 	"github.com/uzqw/vex/pkg/logger"
 )
 
@@ -47,8 +48,10 @@ var (
 	port      = flag.String("port", defaultPort, "Port to listen on")
 	logFormat = flag.String("log-format", "text", "Log format: text or json")
 	logLevel  = flag.String("log-level", "info", "Log level: debug, info, warn, error")
+	indexMode = flag.String("index", "none", "Search index: none, bruteforce, or hnsw")
 	showVer   = flag.Bool("version", false, "Show version and exit")
 	store     *storage.Storage
+	index     storage.Index
 	log       *logger.Logger
 
 	// Version is set at build time via ldflags
@@ -104,11 +107,22 @@ func init() {
 
 	// Initialize storage
 	store = storage.New()
+	switch strings.ToLower(*indexMode) {
+	case "none", "":
+		index = nil
+	case "bruteforce":
+		index = storage.NewBruteForceIndex()
+	case "hnsw":
+		index = storage.NewHNSWIndex()
+	default:
+		fmt.Fprintf(os.Stderr, "invalid -index value %q; expected none, bruteforce, or hnsw\n", *indexMode)
+		os.Exit(2)
+	}
 }
 
 func main() {
 	addr := fmt.Sprintf("%s:%s", *host, *port)
-	log.Info("starting Vex server", slog.String("addr", addr))
+	log.Info("starting Vex server", slog.String("addr", addr), slog.String("index", strings.ToLower(*indexMode)))
 
 	// Start TCP listener
 	listener, err := net.Listen("tcp", addr)
@@ -294,6 +308,7 @@ func handleVSet(log *logger.Logger, writer *protocol.RESPWriter, cmd []string) {
 
 	key := cmd[1]
 	vectorStr := cmd[2]
+	_, existed := store.Get(key)
 
 	// Parse vector
 	values, err := protocol.FastVectorParser(vectorStr)
@@ -308,7 +323,23 @@ func handleVSet(log *logger.Logger, writer *protocol.RESPWriter, cmd []string) {
 		return
 	}
 
-	metrics.Global().IncrementKeys()
+	if index != nil {
+		normalized, ok := store.Get(key)
+		if !ok {
+			_ = writer.WriteError("failed to read normalized vector after set")
+			return
+		}
+		// VSET is an upsert; remove any previous index entry before inserting.
+		_ = index.Delete(key)
+		if err := index.Insert(key, normalized); err != nil {
+			_ = writer.WriteError(fmt.Sprintf("failed to update index: %s", err.Error()))
+			return
+		}
+	}
+
+	if !existed {
+		metrics.Global().IncrementKeys()
+	}
 	_ = writer.WriteSimpleString("OK")
 }
 
@@ -350,6 +381,9 @@ func handleVDel(writer *protocol.RESPWriter, cmd []string) {
 	key := cmd[1]
 	deleted := store.Delete(key)
 	if deleted {
+		if index != nil {
+			_ = index.Delete(key)
+		}
 		metrics.Global().DecrementKeys()
 		_ = writer.WriteInteger(1)
 	} else {
@@ -380,8 +414,17 @@ func handleVSearch(log *logger.Logger, writer *protocol.RESPWriter, cmd []string
 		return
 	}
 
-	// Search
-	results, err := store.Search(query, k)
+	var results []vector.SearchResult
+	if index != nil {
+		normalizedQuery, err := vector.Normalize(query)
+		if err != nil {
+			_ = writer.WriteError(fmt.Sprintf("failed to normalize query: %s", err.Error()))
+			return
+		}
+		results, err = index.Search(normalizedQuery, k)
+	} else {
+		results, err = store.Search(query, k)
+	}
 	if err != nil {
 		_ = writer.WriteError(err.Error())
 		return
@@ -409,6 +452,9 @@ func handleStats(writer *protocol.RESPWriter) {
 // handleClear handles the CLEAR command
 func handleClear(writer *protocol.RESPWriter) {
 	store.Clear()
+	if index != nil {
+		index.Clear()
+	}
 	_ = writer.WriteSimpleString("OK")
 }
 

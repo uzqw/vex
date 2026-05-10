@@ -136,9 +136,14 @@ go run ./cmd/vex-benchmark/main.go \
 - `-host`: Server host (default: "localhost")
 - `-port`: Server port (default: "6379")
 - `-concurrency`: Number of concurrent connections (default: 50)
-- `-n`: Total number of operations (default: 100000)
+- `-n`: Total number of measured operations (default: 100000)
 - `-mode`: Benchmark mode: "insert" or "search" (default: "insert")
 - `-dim`: Vector dimension (default: 128)
+- `-prepare-n`: Number of vectors to load before search benchmarks (default: 1000)
+- `-warmup`: Number of warmup operations to run before measuring (default: 0)
+- `-k`: Top-k value for VSEARCH (default: 10)
+- `-seed`: Random seed for deterministic vectors (default: 42)
+- `-key-prefix`: Key prefix used for generated vectors (default: "vec")
 
 ### Integration Benchmark Output
 

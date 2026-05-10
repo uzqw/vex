@@ -43,6 +43,9 @@ make build
 # Run the server
 make run
 
+# Run with HNSW search index enabled
+go run ./cmd/vex-server/main.go -index=hnsw
+
 # Run with JSON logging
 make run-json
 
@@ -283,10 +286,10 @@ benchstat old.txt new.txt
 make benchmark-custom ARGS="-mode=insert -concurrency=100 -n=200000 -dim=256"
 
 # Custom search benchmark
-make benchmark-custom ARGS="-mode=search -concurrency=50 -n=100000"
+make benchmark-custom ARGS="-mode=search -concurrency=50 -n=100000 -prepare-n=50000 -warmup=5000 -k=10"
 
 # Or run directly
-go run cmd/vex-benchmark/main.go -mode=insert -concurrency=50 -n=100000
+go run cmd/vex-benchmark/main.go -mode=insert -concurrency=50 -n=100000 -warmup=5000
 ```
 
 ### Example Integration Benchmark Output
@@ -391,8 +394,12 @@ make test-coverage
 
 - `-host` - Host to bind to (default: "0.0.0.0")
 - `-port` - Port to listen on (default: "6379")
+- `-index` - Search index: "none", "bruteforce", or "hnsw" (default: "none")
 - `-log-format` - Log format: "text" or "json" (default: "text")
 - `-log-level` - Log level: "debug", "info", "warn", "error" (default: "info")
+
+Use `-index=hnsw` to route `VSEARCH` through the HNSW index. The default `none`
+keeps the original sharded full-scan search path.
 
 ### Persistence Configuration
 
@@ -413,9 +420,14 @@ VEX_PERSISTENCE_ENABLED=true VEX_SNAPSHOT_SECONDS=600 ./vex-server
 - `-host` - Server host (default: "localhost")
 - `-port` - Server port (default: "6379")
 - `-concurrency` - Number of concurrent connections (default: 50)
-- `-n` - Total number of operations (default: 100000)
+- `-n` - Total number of measured operations (default: 100000)
 - `-mode` - Benchmark mode: "insert" or "search" (default: "insert")
 - `-dim` - Vector dimension (default: 128)
+- `-prepare-n` - Number of vectors to load before search benchmarks (default: 1000)
+- `-warmup` - Number of warmup operations to run before measuring (default: 0)
+- `-k` - Top-k value for `VSEARCH` (default: 10)
+- `-seed` - Random seed for deterministic vectors (default: 42)
+- `-key-prefix` - Key prefix used for generated vectors (default: "vec")
 
 ## Performance Characteristics
 

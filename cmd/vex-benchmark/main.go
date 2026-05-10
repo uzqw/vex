@@ -22,6 +22,7 @@ import (
 	"os"
 	"runtime/debug"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,9 +34,14 @@ var (
 	host        = flag.String("host", "localhost", "Server host")
 	port        = flag.String("port", "6379", "Server port")
 	concurrency = flag.Int("concurrency", 50, "Number of concurrent connections")
-	totalOps    = flag.Int("n", 100000, "Total number of operations")
+	totalOps    = flag.Int("n", 100000, "Total number of measured operations")
 	mode        = flag.String("mode", "insert", "Benchmark mode: insert or search")
 	dim         = flag.Int("dim", 128, "Vector dimension")
+	prepareN    = flag.Int("prepare-n", 1000, "Number of vectors to load before search benchmarks")
+	warmupOps   = flag.Int("warmup", 0, "Number of warmup operations to run before measuring")
+	searchK     = flag.Int("k", 10, "Top-k value for VSEARCH")
+	seed        = flag.Int64("seed", 42, "Random seed for deterministic vectors")
+	keyPrefix   = flag.String("key-prefix", "vec", "Key prefix used for generated vectors")
 	showVer     = flag.Bool("version", false, "Show version and exit")
 
 	// Version is set at build time via ldflags
@@ -57,7 +63,6 @@ type BenchmarkResult struct {
 }
 
 func main() {
-	// Customize usage output
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: vex-benchmark [options]\n\n")
 		fmt.Fprintf(os.Stderr, "Vex Benchmark is a performance validation tool for the Vex vector database.\n\n")
@@ -67,7 +72,6 @@ func main() {
 
 	flag.Parse()
 
-	// Handle version detection for 'go install'
 	if Version == "dev" {
 		if info, ok := debug.ReadBuildInfo(); ok {
 			if info.Main.Version != "" && info.Main.Version != "(devel)" {
@@ -81,148 +85,153 @@ func main() {
 		return
 	}
 
+	if err := validateFlags(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(2)
+	}
+
 	fmt.Println("=== Vex Benchmark ===")
 	fmt.Printf("Mode:        %s\n", *mode)
 	fmt.Printf("Host:        %s:%s\n", *host, *port)
 	fmt.Printf("Concurrency: %d\n", *concurrency)
 	fmt.Printf("Total Ops:   %d\n", *totalOps)
 	fmt.Printf("Dimensions:  %d\n", *dim)
+	fmt.Printf("K:           %d\n", *searchK)
+	fmt.Printf("Prepare N:   %d\n", *prepareN)
+	fmt.Printf("Warmup Ops:  %d\n", *warmupOps)
+	fmt.Printf("Seed:        %d\n", *seed)
 	fmt.Println("---")
 
 	var result *BenchmarkResult
-	switch *mode {
+	switch strings.ToLower(*mode) {
 	case "insert":
 		result = runInsertBenchmark()
 	case "search":
 		result = runSearchBenchmark()
 	default:
 		fmt.Printf("Unknown mode: %s\n", *mode)
-		return
+		os.Exit(2)
 	}
 
 	printResult(result)
 }
 
-func runInsertBenchmark() *BenchmarkResult {
-	var wg sync.WaitGroup
-	var successCount, errorCount atomic.Int64
-	latencies := make([]time.Duration, *totalOps)
-	opsPerWorker := *totalOps / *concurrency
-
-	startTime := time.Now()
-
-	for i := 0; i < *concurrency; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-
-			// Create connection for this worker
-			conn, err := net.Dial("tcp", net.JoinHostPort(*host, *port))
-			if err != nil {
-				errorCount.Add(int64(opsPerWorker))
-				return
-			}
-			defer func() { _ = conn.Close() }()
-
-			writer := protocol.NewRESPWriter(conn)
-			reader := protocol.NewRESPReader(conn)
-
-			for j := 0; j < opsPerWorker; j++ {
-				idx := workerID*opsPerWorker + j
-				key := fmt.Sprintf("vec:%d", idx)
-				vector := generateRandomVector(*dim)
-
-				opStart := time.Now()
-
-				// Send VSET command
-				cmd := []string{"VSET", key, formatVector(vector)}
-				if err := sendCommand(writer, cmd); err != nil {
-					errorCount.Add(1)
-					continue
-				}
-
-				// Read response
-				_, err := reader.ReadCommand()
-				if err != nil {
-					errorCount.Add(1)
-					continue
-				}
-
-				latency := time.Since(opStart)
-				latencies[idx] = latency
-				successCount.Add(1)
-			}
-		}(i)
+func validateFlags() error {
+	if *concurrency <= 0 {
+		return fmt.Errorf("concurrency must be positive")
 	}
+	if *totalOps <= 0 {
+		return fmt.Errorf("n must be positive")
+	}
+	if *dim <= 0 {
+		return fmt.Errorf("dim must be positive")
+	}
+	if *searchK <= 0 {
+		return fmt.Errorf("k must be positive")
+	}
+	if *prepareN < 0 {
+		return fmt.Errorf("prepare-n cannot be negative")
+	}
+	if *warmupOps < 0 {
+		return fmt.Errorf("warmup cannot be negative")
+	}
+	return nil
+}
 
-	wg.Wait()
-	totalTime := time.Since(startTime)
-
-	return calculateResult(latencies, totalTime, successCount.Load(), errorCount.Load())
+func runInsertBenchmark() *BenchmarkResult {
+	if *warmupOps > 0 {
+		fmt.Printf("Running %d warmup insert operations...\n", *warmupOps)
+		runWorkload("insert", *warmupOps, false)
+	}
+	return runWorkload("insert", *totalOps, true)
 }
 
 func runSearchBenchmark() *BenchmarkResult {
-	// First, insert some vectors to search against
-	fmt.Println("Preparing data for search benchmark...")
+	fmt.Printf("Preparing %d vectors for search benchmark...\n", *prepareN)
 	prepareSearchData()
+	if *warmupOps > 0 {
+		fmt.Printf("Running %d warmup search operations...\n", *warmupOps)
+		runWorkload("search", *warmupOps, false)
+	}
+	return runWorkload("search", *totalOps, true)
+}
 
+func runWorkload(workload string, ops int, recordLatency bool) *BenchmarkResult {
 	var wg sync.WaitGroup
 	var successCount, errorCount atomic.Int64
-	latencies := make([]time.Duration, *totalOps)
-	opsPerWorker := *totalOps / *concurrency
+	var next atomic.Int64
+	latencies := make([]time.Duration, ops)
 
 	startTime := time.Now()
-
-	for i := 0; i < *concurrency; i++ {
+	for workerID := 0; workerID < *concurrency; workerID++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
 
-			// Create connection for this worker
 			conn, err := net.Dial("tcp", net.JoinHostPort(*host, *port))
 			if err != nil {
-				errorCount.Add(int64(opsPerWorker))
+				errorCount.Add(1)
 				return
 			}
 			defer func() { _ = conn.Close() }()
 
 			writer := protocol.NewRESPWriter(conn)
 			reader := protocol.NewRESPReader(conn)
+			rng := rand.New(rand.NewSource(*seed + int64(workerID)*7919 + int64(ops)))
 
-			for j := 0; j < opsPerWorker; j++ {
-				idx := workerID*opsPerWorker + j
-				vector := generateRandomVector(*dim)
+			for {
+				idx := int(next.Add(1) - 1)
+				if idx >= ops {
+					return
+				}
 
+				cmd := buildCommand(workload, idx, rng)
 				opStart := time.Now()
 
-				// Send VSEARCH command
-				cmd := []string{"VSEARCH", formatVector(vector), "10"}
 				if err := sendCommand(writer, cmd); err != nil {
 					errorCount.Add(1)
 					continue
 				}
-
-				// Read response
-				_, err := reader.ReadCommand()
-				if err != nil {
+				if _, err := reader.ReadCommand(); err != nil {
 					errorCount.Add(1)
 					continue
 				}
 
-				latency := time.Since(opStart)
-				latencies[idx] = latency
+				if recordLatency {
+					latencies[idx] = time.Since(opStart)
+				}
 				successCount.Add(1)
 			}
-		}(i)
+		}(workerID)
 	}
-
 	wg.Wait()
-	totalTime := time.Since(startTime)
 
-	return calculateResult(latencies, totalTime, successCount.Load(), errorCount.Load())
+	totalTime := time.Since(startTime)
+	if !recordLatency {
+		return nil
+	}
+	return calculateResult(latencies, ops, totalTime, successCount.Load(), errorCount.Load())
+}
+
+func buildCommand(workload string, idx int, rng *rand.Rand) []string {
+	vector := generateRandomVector(*dim, rng)
+	switch workload {
+	case "insert":
+		key := fmt.Sprintf("%s:%d", *keyPrefix, idx)
+		return []string{"VSET", key, formatVector(vector)}
+	case "search":
+		return []string{"VSEARCH", formatVector(vector), fmt.Sprintf("%d", *searchK)}
+	default:
+		panic(fmt.Sprintf("unknown workload %q", workload))
+	}
 }
 
 func prepareSearchData() {
+	if *prepareN == 0 {
+		fmt.Println("Data preparation skipped.")
+		return
+	}
+
 	conn, err := net.Dial("tcp", net.JoinHostPort(*host, *port))
 	if err != nil {
 		fmt.Printf("Failed to connect: %s\n", err)
@@ -232,20 +241,26 @@ func prepareSearchData() {
 
 	writer := protocol.NewRESPWriter(conn)
 	reader := protocol.NewRESPReader(conn)
+	rng := rand.New(rand.NewSource(*seed))
 
-	// Insert 1000 vectors
-	for i := 0; i < 1000; i++ {
-		key := fmt.Sprintf("vec:%d", i)
-		vector := generateRandomVector(*dim)
+	var inserted, errors int
+	for i := 0; i < *prepareN; i++ {
+		key := fmt.Sprintf("%s:prepare:%d", *keyPrefix, i)
+		vector := generateRandomVector(*dim, rng)
 
 		cmd := []string{"VSET", key, formatVector(vector)}
 		if err := sendCommand(writer, cmd); err != nil {
+			errors++
 			continue
 		}
-		_, _ = reader.ReadCommand()
+		if _, err := reader.ReadCommand(); err != nil {
+			errors++
+			continue
+		}
+		inserted++
 	}
 
-	fmt.Println("Data preparation complete.")
+	fmt.Printf("Data preparation complete: inserted=%d errors=%d.\n", inserted, errors)
 }
 
 func sendCommand(writer *protocol.RESPWriter, cmd []string) error {
@@ -255,28 +270,29 @@ func sendCommand(writer *protocol.RESPWriter, cmd []string) error {
 	return writer.Flush()
 }
 
-func generateRandomVector(dim int) []float32 {
+func generateRandomVector(dim int, rng *rand.Rand) []float32 {
 	vec := make([]float32, dim)
-	for i := 0; i < dim; i++ {
-		vec[i] = rand.Float32()*2 - 1 // Random value between -1 and 1
+	for i := range vec {
+		vec[i] = rng.Float32()*2 - 1
 	}
 	return vec
 }
 
 func formatVector(vec []float32) string {
-	result := "["
+	var b strings.Builder
+	b.Grow(len(vec) * 10)
+	b.WriteByte('[')
 	for i, v := range vec {
 		if i > 0 {
-			result += ", "
+			b.WriteString(", ")
 		}
-		result += fmt.Sprintf("%.6f", v)
+		b.WriteString(fmt.Sprintf("%.6f", v))
 	}
-	result += "]"
-	return result
+	b.WriteByte(']')
+	return b.String()
 }
 
-func calculateResult(latencies []time.Duration, totalTime time.Duration, successCount, errorCount int64) *BenchmarkResult {
-	// Filter out zero latencies (errors)
+func calculateResult(latencies []time.Duration, totalOps int, totalTime time.Duration, successCount, errorCount int64) *BenchmarkResult {
 	validLatencies := make([]time.Duration, 0, successCount)
 	for _, l := range latencies {
 		if l > 0 {
@@ -286,27 +302,25 @@ func calculateResult(latencies []time.Duration, totalTime time.Duration, success
 
 	if len(validLatencies) == 0 {
 		return &BenchmarkResult{
-			TotalOps:     *totalOps,
+			TotalOps:     totalOps,
 			TotalTime:    totalTime,
 			SuccessCount: successCount,
 			ErrorCount:   errorCount,
 		}
 	}
 
-	// Sort latencies for percentile calculation
 	sort.Slice(validLatencies, func(i, j int) bool {
 		return validLatencies[i] < validLatencies[j]
 	})
 
-	// Calculate statistics
 	var totalLatency time.Duration
 	for _, l := range validLatencies {
 		totalLatency += l
 	}
 
 	n := len(validLatencies)
-	result := &BenchmarkResult{
-		TotalOps:     *totalOps,
+	return &BenchmarkResult{
+		TotalOps:     totalOps,
 		TotalTime:    totalTime,
 		QPS:          float64(successCount) / totalTime.Seconds(),
 		AvgLatency:   totalLatency / time.Duration(n),
@@ -318,8 +332,6 @@ func calculateResult(latencies []time.Duration, totalTime time.Duration, success
 		SuccessCount: successCount,
 		ErrorCount:   errorCount,
 	}
-
-	return result
 }
 
 func printResult(result *BenchmarkResult) {
