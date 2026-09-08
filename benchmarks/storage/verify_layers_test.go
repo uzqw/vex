@@ -23,6 +23,10 @@ import (
 
 // TestHNSWLayerDistribution verifies that HNSW builds multiple layers
 func TestHNSWLayerDistribution(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping layer distribution tests in short mode")
+	}
+
 	tests := []struct {
 		name       string
 		numVectors int
@@ -89,6 +93,10 @@ func TestHNSWLayerDistribution(t *testing.T) {
 
 // TestHNSWMultiLayerSearch verifies search works across multiple layers
 func TestHNSWMultiLayerSearch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping multi-layer search test in short mode")
+	}
+
 	index := storage.NewHNSWIndex()
 	dim := 128
 
