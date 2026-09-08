@@ -1,0 +1,39 @@
+{
+  "source": "ftp://ftp.irisa.fr/local/texmex/corpus/gist.tar.gz",
+  "archive": {
+    "bytes": 2740172684,
+    "md5": "31185e0f00854f74d27e8ad8d52628a9"
+  },
+  "files": {
+    "base": {
+      "file": "gist_base.fvecs",
+      "count": 1000000,
+      "dim": 960,
+      "sample": [
+        0.045899998396635056,
+        0.04390000179409981,
+        0.025100000202655792
+      ]
+    },
+    "query": {
+      "file": "gist_query.fvecs",
+      "count": 1000,
+      "dim": 960,
+      "sample": [
+        0.011699999682605267,
+        0.011500000022351742,
+        0.008700000122189522
+      ]
+    },
+    "groundtruth": {
+      "file": "gist_groundtruth.ivecs",
+      "count": 1000,
+      "dim": 100,
+      "sample": [
+        786559,
+        624520,
+        726827
+      ]
+    }
+  }
+}
