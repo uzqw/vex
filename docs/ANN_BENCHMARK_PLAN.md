@@ -118,5 +118,25 @@ evaluating Vex's recall without any conversion.
 ## 6. Deliverables
 
 - `benchmarks/gist1m/` — download/convert/benchmark scripts.
-- `benchmarks/gist1m/results/` — raw results and the comparison table.
-- This plan document, updated with a results section once the benchmark runs.
+- `benchmarks/gist1m/results.json` — Vex GIST1M insert/recall@10/QPS run.
+- `benchmarks/gist1m/comparison.md` — comparison table vs public ann-benchmarks.
+- This plan document, including the results section below.
+
+## 7. Results
+
+Vex GIST1M (HNSW M=16, ef=efC=600, seed=1): **recall@10 = 0.3479**, **QPS = 162.68**
+on Intel Core Ultra 9 285H. Full table and source citations:
+[`benchmarks/gist1m/comparison.md`](../benchmarks/gist1m/comparison.md).
+
+| Library | Config | recall@10 | QPS |
+|---|---|---:|---:|
+| **Vex** | HNSW M=16, ef=600, efC=600, seed=1 | 0.3479 | 162.68 |
+| hnswlib | M=8, efC=500 | 0.4122 | 4017.66 |
+| hnsw(faiss) | M=8, efC=500, ef=20 | 0.3777 | 3317.49 |
+| hnswlib | M=24, efC=500 | 0.9899 | 194.78 |
+| hnsw(faiss) | M=8, efC=500, ef=800 | 0.9534 | 149.58 |
+
+Public rows are from
+[gist-960-euclidean (k=10)](https://ann-benchmarks.com/gist-960-euclidean_10_euclidean.html).
+QPS is not comparable across machines; recall is. At similar recall, published
+HNSW is thousands of QPS; at similar QPS, published HNSW is recall@10 ≈ 0.95–0.99.
