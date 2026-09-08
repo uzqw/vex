@@ -166,9 +166,10 @@ func (s *VectorSnapshot) Load(ctx context.Context) error {
 		return fmt.Errorf("failed to load metadata: %w", err)
 	}
 
-	// Load vectors
+	// Load vectors. Dimension comes from snapshot metadata because the live
+	// data source is typically empty on recovery (GetDimension() == 0).
 	vectorsPath := filepath.Join(latestDir, vectorsFile)
-	vectors, checksum, err := s.loadVectors(vectorsPath)
+	vectors, checksum, err := s.loadVectors(vectorsPath, metadata.Dimension)
 	if err != nil {
 		return fmt.Errorf("failed to load vectors: %w", err)
 	}
@@ -304,8 +305,8 @@ func (s *VectorSnapshot) writeVector(w io.Writer, key string, vec []float32) err
 	return nil
 }
 
-// loadVectors reads vectors from disk
-func (s *VectorSnapshot) loadVectors(path string) (map[string][]float32, []byte, error) {
+// loadVectors reads vectors from disk using dim from snapshot metadata.
+func (s *VectorSnapshot) loadVectors(path string, dim int) (map[string][]float32, []byte, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err
@@ -332,7 +333,7 @@ func (s *VectorSnapshot) loadVectors(path string) (map[string][]float32, []byte,
 	// Read vectors
 	vectors := make(map[string][]float32, count)
 	for i := 0; i < count; i++ {
-		key, vec, err := s.readVector(reader)
+		key, vec, err := s.readVector(reader, dim)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to read vector %d: %w", i, err)
 		}
@@ -371,8 +372,8 @@ func (s *VectorSnapshot) readHeader(r io.Reader) (int, error) {
 	return int(count), nil
 }
 
-// readVector reads a single vector entry
-func (s *VectorSnapshot) readVector(r io.Reader) (string, []float32, error) {
+// readVector reads a single vector entry. dim is the snapshot dimension.
+func (s *VectorSnapshot) readVector(r io.Reader, dim int) (string, []float32, error) {
 	// Read key length
 	var keyLen uint16
 	if err := binary.Read(r, binary.LittleEndian, &keyLen); err != nil {
@@ -386,10 +387,12 @@ func (s *VectorSnapshot) readVector(r io.Reader) (string, []float32, error) {
 	}
 	key := string(keyBytes)
 
-	// Read vector dimension (we need to know it from metadata)
-	// For now, read until we can't anymore or use stored dimension
-	// This is a simplification - in production, dimension should be in header
-	dim := s.dataSource.GetDimension()
+	if dim <= 0 {
+		dim = s.dataSource.GetDimension()
+	}
+	if dim <= 0 {
+		return "", nil, fmt.Errorf("%w: missing vector dimension", ErrInvalidFormat)
+	}
 	vec := make([]float32, dim)
 	if err := binary.Read(r, binary.LittleEndian, vec); err != nil {
 		return "", nil, err

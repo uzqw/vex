@@ -744,7 +744,7 @@ func TestReadVectorErrors(t *testing.T) {
 	// Empty reader
 	t.Run("fail on key length", func(t *testing.T) {
 		r := bytes.NewReader([]byte{})
-		_, _, err := snap.readVector(r)
+		_, _, err := snap.readVector(r, 2)
 		if err == nil {
 			t.Fatal("expected error reading key length")
 		}
@@ -756,7 +756,7 @@ func TestReadVectorErrors(t *testing.T) {
 		if err := binary.Write(buf, binary.LittleEndian, uint16(10)); err != nil {
 			t.Fatal(err)
 		}
-		_, _, err := snap.readVector(buf)
+		_, _, err := snap.readVector(buf, 2)
 		if err == nil {
 			t.Fatal("expected error reading key data")
 		}
@@ -770,9 +770,52 @@ func TestReadVectorErrors(t *testing.T) {
 		}
 		buf.Write([]byte("ab"))
 		// no float32 data follows; dimension=2 expects 8 bytes
-		_, _, err := snap.readVector(buf)
+		_, _, err := snap.readVector(buf, 2)
 		if err == nil {
 			t.Fatal("expected error reading vector data")
 		}
 	})
+}
+
+func TestSnapshotLoadWhenDimensionUnset(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "vex-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	testVectors := map[string][]float32{
+		"vec1": {1.0, 2.0, 3.0, 4.0},
+		"vec2": {5.0, 6.0, 7.0, 8.0},
+	}
+	saveDS := &mockDataSource{vectors: testVectors, dimension: 4}
+	cfg := Config{Enabled: true, DataDir: tempDir, Compression: "none", Checksum: true}
+	if err := NewVectorSnapshot(cfg, saveDS).Save(context.Background()); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+
+	// Recovery path: empty store, dimension not yet known.
+	loadDS := &mockDataSource{vectors: make(map[string][]float32), dimension: 0}
+	if err := NewVectorSnapshot(cfg, loadDS).Load(context.Background()); err != nil {
+		t.Fatalf("Load into empty store failed: %v", err)
+	}
+	if len(loadDS.vectors) != len(testVectors) {
+		t.Fatalf("expected %d vectors, got %d", len(testVectors), len(loadDS.vectors))
+	}
+	for key, expected := range testVectors {
+		actual, ok := loadDS.vectors[key]
+		if !ok {
+			t.Errorf("missing key %s", key)
+			continue
+		}
+		if len(actual) != len(expected) {
+			t.Errorf("%s: len %d, want %d", key, len(actual), len(expected))
+			continue
+		}
+		for i := range expected {
+			if actual[i] != expected[i] {
+				t.Errorf("%s[%d] = %f, want %f", key, i, actual[i], expected[i])
+			}
+		}
+	}
 }
