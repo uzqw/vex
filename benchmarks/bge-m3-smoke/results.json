@@ -1,0 +1,23 @@
+{
+  "model": "bge-m3",
+  "corpus": "SQuAD dev-v1.1",
+  "inserted": 1100,
+  "queries": 21,
+  "k": 5,
+  "top1_same_article_rate": 0.8571,
+  "topk_same_article_rate": 0.6667,
+  "embed_seconds": 92.9,
+  "insert_seconds": 0.2,
+  "search_seconds": 0.0,
+  "passed": true,
+  "example": {
+    "query": "He set the NFL's all-time record for career passing yards in this game, but was benched after throwing four interceptions in favor of backup quarterback Brock Osweiler, who took over as the starter for most of the remainder of the regular season.",
+    "top_results": [
+      "Other key receivers included veteran Jerricho Cotchery (39 receptions for 485 yards), rookie Devin Funchess (31 receptions for 473 yards and five touchdowns), and second-year receiver Corey Brown (31 receptions for 447 yards).",
+      "Although the team had a 7\u20130 start, Manning led the NFL in interceptions.",
+      "Pro Bowl quarterback Cam Newton had one of his best seasons, throwing for 3,837 yards and rushing for 636, while recording a career-high and league-leading 45 total touchdowns (35 passing, 10 rushing), a career-low 10 interceptions, and a career-best quarterback rating of 99.4.",
+      "Davis compiled 5\u00bd sacks, four forced fumbles, and four interceptions, while Kuechly led the team in tackles (118) forced two fumbles, and intercepted four passes of his own.",
+      "Newton was limited by Denver's defense, which sacked him seven times and forced him into three turnovers, including a fumble which they recovered for a touchdown."
+    ]
+  }
+}
