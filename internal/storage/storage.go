@@ -244,3 +244,27 @@ func (s *Storage) GetAllKeys() []string {
 	}
 	return keys
 }
+
+// Snapshot returns a consistent copy of all key->vector pairs.
+// All shard RLocks are held for the duration of the copy so concurrent
+// mutations cannot produce a torn view.
+func (s *Storage) Snapshot() map[string][]float32 {
+	for i := 0; i < ShardCount; i++ {
+		s.shards[i].mu.RLock()
+	}
+	defer func() {
+		for i := ShardCount - 1; i >= 0; i-- {
+			s.shards[i].mu.RUnlock()
+		}
+	}()
+
+	out := make(map[string][]float32)
+	for i := 0; i < ShardCount; i++ {
+		for key, vec := range s.shards[i].data {
+			copied := make([]float32, len(vec))
+			copy(copied, vec)
+			out[key] = copied
+		}
+	}
+	return out
+}

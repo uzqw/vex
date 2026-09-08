@@ -135,3 +135,16 @@ func TestBruteForceCount(t *testing.T) {
 		t.Errorf("Count = %d, want 2", bf.Count())
 	}
 }
+
+func TestBruteForceInsertCopiesVector(t *testing.T) {
+	bf := NewBruteForceIndex()
+	v := makeNormVec(1, 0, 0)
+	orig := v[0]
+	if err := bf.Insert("a", v); err != nil {
+		t.Fatal(err)
+	}
+	v[0] = 0
+	if got := bf.data["a"][0]; got != orig {
+		t.Fatalf("index retained caller slice: got %v want %v", got, orig)
+	}
+}

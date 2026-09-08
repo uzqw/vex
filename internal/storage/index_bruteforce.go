@@ -41,7 +41,8 @@ func NewBruteForceIndex() *BruteForceIndex {
 func (bf *BruteForceIndex) Insert(key string, vec []float32) error {
 	bf.mu.Lock()
 	defer bf.mu.Unlock()
-	bf.data[key] = vec
+	// Own a copy so callers cannot mutate index data.
+	bf.data[key] = append([]float32(nil), vec...)
 	return nil
 }
 
