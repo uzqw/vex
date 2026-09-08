@@ -1,0 +1,34 @@
+{
+  "dataset": "GIST1M",
+  "inserted": 999990,
+  "resume_from": 502762,
+  "dim": 960,
+  "queries": 1000,
+  "k": 10,
+  "index": "hnsw",
+  "hnsw": {
+    "m": 16,
+    "ef": 600,
+    "ef_construction": 600,
+    "seed": 1
+  },
+  "skipped_zero_vectors": [
+    7030,
+    113718,
+    141476,
+    184972,
+    192125,
+    224797,
+    244963,
+    244966,
+    618475,
+    620273
+  ],
+  "insert_seconds": 7375.9,
+  "insert_vecs_per_sec": 135.6,
+  "warmup_seconds": 6.1,
+  "search_seconds": 6.1,
+  "qps": 162.68,
+  "recall_at_10": 0.3479,
+  "official_1m": true
+}
