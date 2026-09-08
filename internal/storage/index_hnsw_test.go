@@ -239,6 +239,9 @@ func TestHNSWDelete(t *testing.T) {
 		if h.entryPoint != nil {
 			t.Error("entryPoint should be nil after deleting last node")
 		}
+		if err := h.Insert("b", makeNormVec(1, 0)); err != nil {
+			t.Fatalf("empty index should accept a new dimension: %v", err)
+		}
 	})
 
 	t.Run("deleted node not reachable via search", func(t *testing.T) {
@@ -321,7 +324,10 @@ func TestSelectNeighborsHeuristic(t *testing.T) {
 
 	t.Run("fewer candidates than m returns all", func(t *testing.T) {
 		candidates := []*HNSWNode{makeNode(1, 0), makeNode(0, 1)}
-		got := h.selectNeighborsHeuristic(makeNormVec(1, 0), candidates, 5)
+		got, err := h.selectNeighborsHeuristic(makeNormVec(1, 0), candidates, 5)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if len(got) != 2 {
 			t.Errorf("len = %d, want 2", len(got))
 		}
@@ -332,7 +338,10 @@ func TestSelectNeighborsHeuristic(t *testing.T) {
 		for i := range candidates {
 			candidates[i] = makeNode(float32(i+1), 0)
 		}
-		got := h.selectNeighborsHeuristic(makeNormVec(1, 0), candidates, 4)
+		got, err := h.selectNeighborsHeuristic(makeNormVec(1, 0), candidates, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if len(got) > 4 {
 			t.Errorf("len = %d, want <= 4", len(got))
 		}
@@ -346,7 +355,10 @@ func TestSelectNeighborsHeuristic(t *testing.T) {
 			makeNode(0.99, 0.01, 0),
 			makeNode(0.98, 0.02, 0),
 		}
-		got := h.selectNeighborsHeuristic(query, candidates, 3)
+		got, err := h.selectNeighborsHeuristic(query, candidates, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if len(got) == 0 {
 			t.Error("expected non-empty result with backfill")
 		}
@@ -368,7 +380,9 @@ func TestPruneNeighbors(t *testing.T) {
 				{makeNeighbor(0.1), makeNeighbor(0.2)},
 			},
 		}
-		h.pruneNeighbors(node, 0, 5)
+		if err := h.pruneNeighbors(node, 0, 5); err != nil {
+			t.Fatal(err)
+		}
 		if len(node.Neighbors[0]) != 2 {
 			t.Errorf("expected 2 neighbors, got %d", len(node.Neighbors[0]))
 		}
@@ -380,7 +394,9 @@ func TestPruneNeighbors(t *testing.T) {
 				{makeNeighbor(0.5), makeNeighbor(0.1), makeNeighbor(0.3), makeNeighbor(0.9)},
 			},
 		}
-		h.pruneNeighbors(node, 0, 2)
+		if err := h.pruneNeighbors(node, 0, 2); err != nil {
+			t.Fatal(err)
+		}
 		nb := node.Neighbors[0]
 		if len(nb) != 2 {
 			t.Fatalf("expected 2 neighbors after prune, got %d", len(nb))
@@ -389,6 +405,64 @@ func TestPruneNeighbors(t *testing.T) {
 			t.Errorf("wrong neighbors kept: %.1f, %.1f", nb[0].Distance, nb[1].Distance)
 		}
 	})
+}
+
+func TestComputeLevel(t *testing.T) {
+	mult := float32(1.0 / math.Log(2.0))
+	cases := []struct {
+		name string
+		u    float64
+		mult float32
+		cap  int
+		min  int
+		max  int
+	}{
+		{"u=0", 0, mult, 64, 0, 0},
+		{"u near 1", 0.999999, mult, 64, 1, 64},
+		{"u=1 huge mult", 1, 1e9, 64, 64, 64},
+		{"NaN", math.NaN(), mult, 64, 0, 0},
+		{"cap 8", 1, 1e9, 8, 8, 8},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := computeLevel(tc.u, tc.mult, tc.cap)
+			if got < tc.min || got > tc.max {
+				t.Fatalf("level = %d, want in [%d,%d]", got, tc.min, tc.max)
+			}
+		})
+	}
+}
+
+func TestHNSWLayerInvariant(t *testing.T) {
+	h := NewHNSWIndexWithConfig(HNSWConfig{M: 4, EfConstruct: 32, Ef: 16, Seed: 7})
+	for i := 0; i < 80; i++ {
+		v := makeNormVec(float32(i%5+1), float32(i%3+1), float32(i%7+1), 1)
+		if err := h.Insert(fmt.Sprintf("n%d", i), v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.CheckLayerInvariant(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHNSWCopyAndDimCheck(t *testing.T) {
+	h := NewHNSWIndex()
+	v := makeNormVec(1, 0, 0)
+	orig0 := v[0]
+	if err := h.Insert("a", v); err != nil {
+		t.Fatal(err)
+	}
+	v[0] = 0 // mutate caller slice
+	if got := h.nodes["a"].Vector[0]; got != orig0 {
+		t.Fatalf("index retained caller slice: got %v want %v", got, orig0)
+	}
+	if err := h.Insert("b", makeNormVec(1, 0)); err == nil {
+		t.Fatal("expected dimension mismatch")
+	}
+	if _, err := h.Search(makeNormVec(1, 0), 1); err == nil {
+		t.Fatal("expected query dimension mismatch")
+	}
 }
 
 // ---- distanceBetween --------------------------------------------------------

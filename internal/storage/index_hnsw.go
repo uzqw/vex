@@ -140,14 +140,19 @@ func siftDownMin(h minHeap, parent int) {
 	}
 }
 
+// maxAllowedLevel caps random level assignment to avoid pathological allocations.
+const maxAllowedLevel = 64
+
 // HNSWIndex implements Hierarchical Navigable Small World algorithm.
-// Time complexity: O(log n) for search, O(log n) for insert (amortized)
-// Space complexity: O(n * M) where M is the maximum number of neighbors per node
+// Search and insert are expected sub-linear in practice; cost depends on ef,
+// graph degree, traversed layers, and vector dimension — not a strict O(log n).
+// Space complexity: O(n * M) where M is the maximum number of neighbors per node.
 type HNSWIndex struct {
 	mu          sync.RWMutex
 	nodes       map[string]*HNSWNode // Map from key to node
 	entryPoint  *HNSWNode            // Entry point for search (highest level node)
 	maxLevel    int                  // Maximum layer level
+	dim         int                  // Vector dimension; 0 until first insert
 	levelMult   float32              // Multiplier for level assignment (typically 1.0/ln(2.0))
 	M           int                  // Maximum number of neighbors per layer (layer > 0)
 	EfConstruct int                  // Search width for construction
@@ -215,10 +220,31 @@ func NewHNSWIndexWithConfig(config HNSWConfig) *HNSWIndex {
 	}
 }
 
-// assignLevel assigns a random level to a new node using exponential decay distribution
+// assignLevel assigns a random level to a new node using exponential decay distribution.
+// Uses r in (0,1] so Log never sees 0.
 func (h *HNSWIndex) assignLevel() int {
 	// h.rng is only called inside Insert which holds the write lock, so no extra sync needed
-	return int(-math.Log(h.rng.Float64()) * float64(h.levelMult))
+	return computeLevel(h.rng.Float64(), h.levelMult, maxAllowedLevel)
+}
+
+// computeLevel is a pure helper for level assignment (testable with edge inputs).
+func computeLevel(u float64, levelMult float32, capLevel int) int {
+	// Map u in [0,1) to r in (0,1]: avoid Log(0).
+	r := 1.0 - u
+	if r <= 0 {
+		r = math.SmallestNonzeroFloat64
+	}
+	if math.IsNaN(r) || math.IsInf(r, 0) {
+		return 0
+	}
+	level := int(-math.Log(r) * float64(levelMult))
+	if level < 0 {
+		level = 0
+	}
+	if capLevel > 0 && level > capLevel {
+		level = capLevel
+	}
+	return level
 }
 
 // adaptiveEf is currently a pass-through. Earlier versions scaled ef down for
@@ -245,16 +271,28 @@ func (h *HNSWIndex) Insert(key string, vec []float32) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	// Dimension check before mutating the graph.
+	if h.dim == 0 {
+		if len(vec) == 0 {
+			return fmt.Errorf("vector dimension must be > 0")
+		}
+	} else if len(vec) != h.dim {
+		return fmt.Errorf("dimension mismatch: expected %d, got %d", h.dim, len(vec))
+	}
+
 	// Check if node already exists
 	if _, exists := h.nodes[key]; exists {
 		return fmt.Errorf("vector with key %q already exists", key)
 	}
 
+	// Own a copy so callers cannot mutate graph data.
+	stored := append([]float32(nil), vec...)
+
 	// Create new node
 	level := h.assignLevel()
 	newNode := &HNSWNode{
 		ID:        key,
-		Vector:    vec,
+		Vector:    stored,
 		Level:     level,
 		Neighbors: make([][]*HNSWNeighbor, level+1),
 	}
@@ -262,59 +300,78 @@ func (h *HNSWIndex) Insert(key string, vec []float32) error {
 		newNode.Neighbors[i] = make([]*HNSWNeighbor, 0)
 	}
 
-	h.nodes[key] = newNode
-
 	// If this is the first node
 	if h.entryPoint == nil {
+		h.dim = len(stored)
+		h.nodes[key] = newNode
 		h.entryPoint = newNode
 		h.maxLevel = level
 		return nil
 	}
 
-	// Find nearest neighbors at all levels
+	oldMaxLevel := h.maxLevel
 	currentNearest := h.entryPoint
 
-	// Search from top to target layer
-	for lc := h.maxLevel; lc > level; lc-- {
-		currentNearest, _ = h.searchLayer(vec, currentNearest, lc, 1)
+	// Greedy descent on layers that already exist in the graph.
+	// Layers above oldMaxLevel must not be searched or linked yet.
+	for lc := oldMaxLevel; lc > level; lc-- {
+		var err error
+		currentNearest, _, err = h.searchLayer(stored, currentNearest, lc, 1)
+		if err != nil {
+			return err
+		}
 	}
 
-	// Insert node at all levels from level to 0
-	for lc := level; lc >= 0; lc-- {
-		// fix 3: layer 0 uses 2*M neighbors (paper §4, Mmax0 = 2*M)
+	// Connect only on layers that both the new node and the existing graph share.
+	startLayer := level
+	if startLayer > oldMaxLevel {
+		startLayer = oldMaxLevel
+	}
+
+	for lc := startLayer; lc >= 0; lc-- {
 		mEffective := h.M
 		if lc == 0 {
 			mEffective = h.M * 2
 		}
 
-		candidates := h.searchLayerWithEf(vec, currentNearest, lc, h.adaptiveEf(h.EfConstruct, len(vec)))
-		neighbors := h.selectNeighborsHeuristic(vec, candidates, mEffective)
+		candidates, err := h.searchLayerWithEf(stored, currentNearest, lc, h.adaptiveEf(h.EfConstruct, len(stored)))
+		if err != nil {
+			return err
+		}
+		neighbors, err := h.selectNeighborsHeuristic(stored, candidates, mEffective)
+		if err != nil {
+			return err
+		}
 
-		// Add bidirectional links
 		for _, neighbor := range neighbors {
-			dist, _ := distanceBetween(vec, neighbor.Vector)
+			dist, err := distanceBetween(stored, neighbor.Vector)
+			if err != nil {
+				return err
+			}
 			newNode.Neighbors[lc] = append(newNode.Neighbors[lc], &HNSWNeighbor{
 				Node:     neighbor,
 				Distance: dist,
 			})
 
-			// Prune neighbors of the existing node (only if neighbor has this layer)
 			if neighbor.Level >= lc {
 				neighbor.Neighbors[lc] = append(neighbor.Neighbors[lc], &HNSWNeighbor{
 					Node:     newNode,
 					Distance: dist,
 				})
-				h.pruneNeighbors(neighbor, lc, mEffective)
+				if err := h.pruneNeighbors(neighbor, lc, mEffective); err != nil {
+					return err
+				}
 			}
 		}
 
-		// Update current nearest for next layer
 		if len(neighbors) > 0 {
 			currentNearest = neighbors[0]
 		}
 	}
 
-	// Update entry point if new node's level is higher
+	h.nodes[key] = newNode
+
+	// Layers above oldMaxLevel stay empty; new node becomes entry point.
 	if level > h.maxLevel {
 		h.entryPoint = newNode
 		h.maxLevel = level
@@ -331,12 +388,19 @@ func (h *HNSWIndex) Search(query []float32, k int) ([]vector.SearchResult, error
 	if h.entryPoint == nil {
 		return []vector.SearchResult{}, nil
 	}
+	if h.dim > 0 && len(query) != h.dim {
+		return nil, fmt.Errorf("dimension mismatch: expected %d, got %d", h.dim, len(query))
+	}
 
 	// Search from top layer to layer 0
 	currentNearest := h.entryPoint
 
 	for lc := h.maxLevel; lc > 0; lc-- {
-		currentNearest, _ = h.searchLayer(query, currentNearest, lc, 1)
+		var err error
+		currentNearest, _, err = h.searchLayer(query, currentNearest, lc, 1)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Search at layer 0 with ef parameter. ef must cover k, otherwise
@@ -345,12 +409,18 @@ func (h *HNSWIndex) Search(query []float32, k int) ([]vector.SearchResult, error
 	if searchEf < k {
 		searchEf = k
 	}
-	candidates := h.searchLayerWithEf(query, currentNearest, 0, searchEf)
+	candidates, err := h.searchLayerWithEf(query, currentNearest, 0, searchEf)
+	if err != nil {
+		return nil, err
+	}
 
 	// Extract top-k results
 	results := make([]vector.SearchResult, 0, k)
 	for i := 0; i < k && i < len(candidates); i++ {
-		distance, _ := distanceBetween(query, candidates[i].Vector)
+		distance, err := distanceBetween(query, candidates[i].Vector)
+		if err != nil {
+			return nil, err
+		}
 		// distance is negative similarity, so negate it to get actual similarity
 		results = append(results, vector.SearchResult{
 			Key:        candidates[i].ID,
@@ -364,17 +434,20 @@ func (h *HNSWIndex) Search(query []float32, k int) ([]vector.SearchResult, error
 // searchLayer performs a greedy search on a specific layer, returning the single closest node.
 // C (candidates) is a min-heap so we always expand the nearest node first.
 // W (working set) is a max-heap so we can cheaply evict the worst result.
-func (h *HNSWIndex) searchLayer(query []float32, entryPoint *HNSWNode, layer int, ef int) (*HNSWNode, float32) {
+func (h *HNSWIndex) searchLayer(query []float32, entryPoint *HNSWNode, layer int, ef int) (*HNSWNode, float32, error) {
 	visited := make(map[*HNSWNode]bool)
 	C := make(minHeap, 0, ef) // candidates: min-heap, closest at top
 	W := make(maxHeap, 0, ef) // working set: max-heap, furthest (worst) at top
 
-	dist, _ := distanceBetween(query, entryPoint.Vector)
+	dist, err := distanceBetween(query, entryPoint.Vector)
+	if err != nil {
+		return nil, 0, err
+	}
 	C.push(candidate{node: entryPoint, distance: dist})
 	W.push(candidate{node: entryPoint, distance: dist})
 	visited[entryPoint] = true
 
-	// fix 4: track best inline instead of scanning W at the end
+	// Track best inline instead of scanning W at the end
 	best, bestDist := entryPoint, dist
 
 	for len(C) > 0 {
@@ -393,7 +466,10 @@ func (h *HNSWIndex) searchLayer(query []float32, entryPoint *HNSWNode, layer int
 					continue
 				}
 				visited[nb] = true
-				d, _ := distanceBetween(query, nb.Vector)
+				d, err := distanceBetween(query, nb.Vector)
+				if err != nil {
+					return nil, 0, err
+				}
 
 				if d < W[0].distance || len(W) < ef {
 					C.push(candidate{node: nb, distance: d})
@@ -410,17 +486,20 @@ func (h *HNSWIndex) searchLayer(query []float32, entryPoint *HNSWNode, layer int
 		}
 	}
 
-	return best, bestDist
+	return best, bestDist, nil
 }
 
 // searchLayerWithEf performs greedy search and returns up to ef candidates sorted closest-first.
 // C (candidates) is a min-heap; W (working set) is a max-heap.
-func (h *HNSWIndex) searchLayerWithEf(query []float32, entryPoint *HNSWNode, layer int, ef int) []*HNSWNode {
+func (h *HNSWIndex) searchLayerWithEf(query []float32, entryPoint *HNSWNode, layer int, ef int) ([]*HNSWNode, error) {
 	visited := make(map[*HNSWNode]bool)
 	C := make(minHeap, 0, ef) // candidates: min-heap
 	W := make(maxHeap, 0, ef) // working set: max-heap
 
-	dist, _ := distanceBetween(query, entryPoint.Vector)
+	dist, err := distanceBetween(query, entryPoint.Vector)
+	if err != nil {
+		return nil, err
+	}
 	C.push(candidate{node: entryPoint, distance: dist})
 	W.push(candidate{node: entryPoint, distance: dist})
 	visited[entryPoint] = true
@@ -441,7 +520,10 @@ func (h *HNSWIndex) searchLayerWithEf(query []float32, entryPoint *HNSWNode, lay
 					continue
 				}
 				visited[nb] = true
-				d, _ := distanceBetween(query, nb.Vector)
+				d, err := distanceBetween(query, nb.Vector)
+				if err != nil {
+					return nil, err
+				}
 
 				if d < W[0].distance || len(W) < ef {
 					C.push(candidate{node: nb, distance: d})
@@ -464,7 +546,7 @@ func (h *HNSWIndex) searchLayerWithEf(query []float32, entryPoint *HNSWNode, lay
 			result[write] = n
 		}
 	}
-	return result[write:]
+	return result[write:], nil
 }
 
 // selectNeighborsHeuristic implements HNSW paper Algorithm 4.
@@ -475,9 +557,9 @@ func (h *HNSWIndex) searchLayerWithEf(query []float32, entryPoint *HNSWNode, lay
 //
 // keepPrunedConnections=true: if the heuristic leaves fewer than m neighbors we backfill
 // from the discarded set so the graph stays well-connected.
-func (h *HNSWIndex) selectNeighborsHeuristic(query []float32, candidates []*HNSWNode, m int) []*HNSWNode {
+func (h *HNSWIndex) selectNeighborsHeuristic(query []float32, candidates []*HNSWNode, m int) ([]*HNSWNode, error) {
 	if len(candidates) <= m {
-		return candidates
+		return candidates, nil
 	}
 
 	// Limit the working set to 3*M closest candidates.
@@ -497,12 +579,18 @@ func (h *HNSWIndex) selectNeighborsHeuristic(query []float32, candidates []*HNSW
 		if len(selected) >= m {
 			break
 		}
-		distQE, _ := distanceBetween(query, e.Vector)
+		distQE, err := distanceBetween(query, e.Vector)
+		if err != nil {
+			return nil, err
+		}
 
 		// e is dominated if any already-selected neighbor r is closer to e than q is
 		dominated := false
 		for _, r := range selected {
-			distER, _ := distanceBetween(e.Vector, r.Vector)
+			distER, err := distanceBetween(e.Vector, r.Vector)
+			if err != nil {
+				return nil, err
+			}
 			if distER < distQE {
 				dominated = true
 				break
@@ -524,15 +612,14 @@ func (h *HNSWIndex) selectNeighborsHeuristic(query []float32, candidates []*HNSW
 		selected = append(selected, e)
 	}
 
-	return selected
+	return selected, nil
 }
 
-// pruneNeighbors trims a node's neighbor list to at most m entries.
-// fix 2: use sort.Slice (O(n log n)) instead of the previous O(n²) bubble sort.
-func (h *HNSWIndex) pruneNeighbors(node *HNSWNode, layer int, m int) {
+// pruneNeighbors trims a node's neighbor list to at most m closest entries.
+func (h *HNSWIndex) pruneNeighbors(node *HNSWNode, layer int, m int) error {
 	neighbors := node.Neighbors[layer]
 	if len(neighbors) <= m {
-		return
+		return nil
 	}
 
 	sort.Slice(neighbors, func(i, j int) bool {
@@ -540,6 +627,7 @@ func (h *HNSWIndex) pruneNeighbors(node *HNSWNode, layer int, m int) {
 	})
 
 	node.Neighbors[layer] = neighbors[:m]
+	return nil
 }
 
 // Delete removes a vector from the index and repairs all neighbor lists that
@@ -574,6 +662,9 @@ func (h *HNSWIndex) Delete(key string) error {
 	}
 
 	delete(h.nodes, key)
+	if len(h.nodes) == 0 {
+		h.dim = 0
+	}
 
 	// If the deleted node was the entry point, elect a new one at the highest level
 	if h.entryPoint == node {
@@ -597,6 +688,24 @@ func (h *HNSWIndex) Clear() {
 	h.nodes = make(map[string]*HNSWNode)
 	h.entryPoint = nil
 	h.maxLevel = 0
+	h.dim = 0
+}
+
+// CheckLayerInvariant verifies every neighbor at layer L has Level >= L.
+// Intended for tests.
+func (h *HNSWIndex) CheckLayerInvariant() error {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, node := range h.nodes {
+		for layer := 0; layer <= node.Level; layer++ {
+			for _, nb := range node.Neighbors[layer] {
+				if nb.Node.Level < layer {
+					return fmt.Errorf("node %q layer %d neighbor %q has level %d", node.ID, layer, nb.Node.ID, nb.Node.Level)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // Count returns the number of vectors in the index
