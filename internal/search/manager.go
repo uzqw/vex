@@ -1,0 +1,423 @@
+// Copyright 2025 uzqw
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package search
+
+import (
+	"fmt"
+	"math"
+	"sort"
+	"sync"
+
+	"github.com/uzqw/vex/internal/storage"
+	"github.com/uzqw/vex/internal/vector"
+)
+
+// Mode controls how the Manager maintains and queries the secondary index.
+type Mode int
+
+const (
+	// ModeNone always searches Storage (linear scan).
+	ModeNone Mode = iota
+	// ModeBruteForce keeps a BruteForceIndex in sync with Storage.
+	ModeBruteForce
+	// ModeHNSW keeps an HNSW index in sync with Storage.
+	ModeHNSW
+	// ModeAuto stays dormant (Storage search) until AutoMin vectors, then
+	// builds HNSW and uses it. On index failure, falls back to Storage.
+	ModeAuto
+)
+
+// IndexState describes the readiness of the secondary index.
+type IndexState int
+
+const (
+	// StateDormant means no secondary index is active (auto below threshold, or none).
+	StateDormant IndexState = iota
+	// StateReady means the secondary index is consistent and used for search.
+	StateReady
+	// StateDirty means the secondary index may be inconsistent; search falls back to Storage.
+	StateDirty
+)
+
+func (s IndexState) String() string {
+	switch s {
+	case StateDormant:
+		return "dormant"
+	case StateReady:
+		return "ready"
+	case StateDirty:
+		return "dirty"
+	default:
+		return fmt.Sprintf("unknown(%d)", int(s))
+	}
+}
+
+// Config configures a Manager.
+type Config struct {
+	Mode    Mode
+	AutoMin int
+	// NewIndex constructs a fresh secondary index (HNSW or BruteForce).
+	// Required for ModeBruteForce, ModeHNSW, and ModeAuto.
+	NewIndex func() storage.Index
+	// RebuildDeleteRatio triggers a full rebuild after this fraction of
+	// cumulative delete/upsert operations relative to current store size.
+	//
+	// Semantics:
+	//   - NaN (math.NaN()): use mode default (0.10 for HNSW/Auto, disabled for BruteForce)
+	//   - 0: disable periodic mutation rebuild
+	//   - >0: rebuild when mutations >= ratio * store.Count()
+	//
+	// The zero value of Config leaves this as 0.0 which means "disable" unless
+	// UseDefaultRebuildRatio is true.
+	RebuildDeleteRatio float64
+	// UseDefaultRebuildRatio applies mode defaults when RebuildDeleteRatio is 0.
+	// When false (default), 0 means disabled.
+	UseDefaultRebuildRatio bool
+}
+
+// Manager coordinates Storage (source of truth) and an optional secondary index.
+// All VSET/VDEL/VSEARCH/CLEAR paths should go through Manager.
+type Manager struct {
+	mu sync.RWMutex
+
+	store *storage.Storage
+	index storage.Index
+
+	mode    Mode
+	state   IndexState
+	autoMin int
+
+	newIndex           func() storage.Index
+	rebuildDeleteRatio float64 // <=0 disables periodic rebuild
+	mutationSinceBuild int     // deletes + upserts since last successful build/swap
+}
+
+// NewManager creates a Manager. Storage is always the source of truth.
+// If store already contains vectors, HNSW/BruteForce (and Auto above threshold)
+// perform a synchronous rebuild so Search is consistent immediately.
+func NewManager(store *storage.Storage, cfg Config) (*Manager, error) {
+	if store == nil {
+		return nil, fmt.Errorf("store is required")
+	}
+	if cfg.AutoMin <= 0 {
+		cfg.AutoMin = 10000
+	}
+
+	ratio := cfg.RebuildDeleteRatio
+	if math.IsNaN(ratio) || (cfg.UseDefaultRebuildRatio && ratio == 0) {
+		switch cfg.Mode {
+		case ModeHNSW, ModeAuto:
+			ratio = 0.10
+		default:
+			ratio = 0 // BruteForce / None: no mutation rebuild by default
+		}
+	}
+
+	m := &Manager{
+		store:              store,
+		mode:               cfg.Mode,
+		autoMin:            cfg.AutoMin,
+		newIndex:           cfg.NewIndex,
+		rebuildDeleteRatio: ratio,
+		state:              StateDormant,
+	}
+
+	switch cfg.Mode {
+	case ModeNone:
+		// nothing
+	case ModeBruteForce, ModeHNSW:
+		if cfg.NewIndex == nil {
+			return nil, fmt.Errorf("NewIndex is required for mode %v", cfg.Mode)
+		}
+		if store.Count() > 0 {
+			if err := m.rebuildFromStoreLocked(); err != nil {
+				return nil, fmt.Errorf("initial rebuild: %w", err)
+			}
+		} else {
+			m.index = cfg.NewIndex()
+			m.state = StateReady
+		}
+	case ModeAuto:
+		if cfg.NewIndex == nil {
+			return nil, fmt.Errorf("NewIndex is required for auto mode")
+		}
+		if store.Count() >= m.autoMin {
+			if err := m.rebuildFromStoreLocked(); err != nil {
+				return nil, fmt.Errorf("initial rebuild: %w", err)
+			}
+		} else {
+			m.state = StateDormant
+		}
+	default:
+		return nil, fmt.Errorf("unknown mode %v", cfg.Mode)
+	}
+
+	return m, nil
+}
+
+// Set upserts a vector. Storage is written first; index failures mark dirty
+// and do not roll back storage. created is true when the key did not exist.
+func (m *Manager) Set(key string, values []float32) (created bool, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	_, existed := m.store.Get(key)
+	if err := m.store.Set(key, values); err != nil {
+		return false, err
+	}
+	normalized, ok := m.store.Get(key)
+	if !ok {
+		return false, fmt.Errorf("failed to read normalized vector after set")
+	}
+
+	if existed {
+		m.mutationSinceBuild++
+	}
+
+	if err := m.syncAfterSetLocked(key, normalized, existed); err != nil {
+		return !existed, err
+	}
+	return !existed, nil
+}
+
+// Delete removes a key from storage and the secondary index.
+func (m *Manager) Delete(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	deleted := m.store.Delete(key)
+	if !deleted {
+		return false
+	}
+	m.mutationSinceBuild++
+
+	if m.index != nil && m.state == StateReady {
+		if err := m.index.Delete(key); err != nil {
+			m.state = StateDirty
+		}
+	}
+
+	if m.mode == ModeAuto && m.store.Count() < m.autoMin {
+		m.dropIndexLocked()
+	} else {
+		m.maybeRebuildLocked()
+	}
+	return true
+}
+
+// Search finds top-k neighbors. Uses secondary index only when ready; otherwise Storage.
+func (m *Manager) Search(query []float32, k int) ([]vector.SearchResult, error) {
+	m.mu.RLock()
+	useIndex := m.index != nil && m.state == StateReady
+	idx := m.index
+	m.mu.RUnlock()
+
+	if !useIndex {
+		return m.store.Search(query, k)
+	}
+
+	normalized, err := vector.Normalize(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to normalize query: %w", err)
+	}
+	results, err := idx.Search(normalized, k)
+	if err != nil {
+		fallback, ferr := m.store.Search(query, k)
+		if ferr != nil {
+			// Query/storage error, not an index fault.
+			return nil, err
+		}
+		// Index fault: mark dirty if still the published instance, then fall back.
+		m.mu.Lock()
+		if m.index == idx {
+			m.state = StateDirty
+		}
+		m.mu.Unlock()
+		return fallback, nil
+	}
+	return results, nil
+}
+
+// Clear wipes storage and the secondary index.
+func (m *Manager) Clear() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.store.Clear()
+	// Drop without Clear so in-flight Search on the old pointer can finish.
+	m.index = nil
+	m.state = StateDormant
+	m.mutationSinceBuild = 0
+	if m.mode == ModeBruteForce || m.mode == ModeHNSW {
+		m.index = m.newIndex()
+		m.state = StateReady
+	}
+}
+
+// Count returns the number of vectors in storage.
+func (m *Manager) Count() int {
+	return m.store.Count()
+}
+
+// Get returns a vector from storage.
+func (m *Manager) Get(key string) ([]float32, bool) {
+	return m.store.Get(key)
+}
+
+// State returns the current index readiness (for tests/stats).
+func (m *Manager) State() IndexState {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.state
+}
+
+// Mode returns the configured mode.
+func (m *Manager) Mode() Mode {
+	return m.mode
+}
+
+// IndexCount returns secondary index size, or -1 if none.
+func (m *Manager) IndexCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.index == nil {
+		return -1
+	}
+	return m.index.Count()
+}
+
+// Rebuild rebuilds the secondary index from a storage snapshot (if mode uses one).
+func (m *Manager) Rebuild() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.rebuildFromStoreLocked()
+}
+
+func (m *Manager) syncAfterSetLocked(key string, normalized []float32, existed bool) error {
+	switch m.mode {
+	case ModeNone:
+		return nil
+
+	case ModeBruteForce, ModeHNSW:
+		if m.state != StateReady || m.index == nil {
+			_ = m.rebuildFromStoreLocked() // storage already committed
+			return nil
+		}
+		if existed {
+			if err := m.index.Delete(key); err != nil {
+				m.state = StateDirty
+				return nil
+			}
+		}
+		if err := m.index.Insert(key, normalized); err != nil {
+			m.state = StateDirty
+			return nil // storage already committed
+		}
+		m.maybeRebuildLocked()
+		return nil
+
+	case ModeAuto:
+		count := m.store.Count()
+		if count < m.autoMin {
+			if m.index != nil {
+				m.dropIndexLocked()
+			}
+			return nil
+		}
+		if m.state != StateReady || m.index == nil {
+			_ = m.rebuildFromStoreLocked() // storage already committed
+			return nil
+		}
+		if existed {
+			if err := m.index.Delete(key); err != nil {
+				m.state = StateDirty
+				return nil
+			}
+		}
+		if err := m.index.Insert(key, normalized); err != nil {
+			m.state = StateDirty
+			return nil
+		}
+		m.maybeRebuildLocked()
+		return nil
+	}
+	return nil
+}
+
+func (m *Manager) maybeRebuildLocked() {
+	if m.state == StateDirty {
+		_ = m.rebuildFromStoreLocked()
+		return
+	}
+	if m.state != StateReady || m.index == nil {
+		return
+	}
+	if m.rebuildDeleteRatio <= 0 {
+		return
+	}
+	n := m.store.Count()
+	if n == 0 {
+		return
+	}
+	if float64(m.mutationSinceBuild) >= float64(n)*m.rebuildDeleteRatio {
+		_ = m.rebuildFromStoreLocked()
+	}
+}
+
+// dropIndexLocked unpublishes the secondary index without Clear() so concurrent
+// Search calls holding the old pointer can finish safely.
+func (m *Manager) dropIndexLocked() {
+	m.index = nil
+	m.state = StateDormant
+	m.mutationSinceBuild = 0
+}
+
+// rebuildFromStoreLocked builds a fresh index from a consistent snapshot and swaps it in.
+// The previous index is not Clear()'d so in-flight Search on the old pointer remains valid.
+func (m *Manager) rebuildFromStoreLocked() error {
+	if m.mode == ModeNone {
+		return nil
+	}
+	if m.mode == ModeAuto && m.store.Count() < m.autoMin {
+		m.dropIndexLocked()
+		return nil
+	}
+	if m.newIndex == nil {
+		m.state = StateDirty
+		return fmt.Errorf("no index factory configured")
+	}
+
+	snap := m.store.Snapshot()
+	keys := make([]string, 0, len(snap))
+	for k := range snap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	newIdx := m.newIndex()
+	for _, key := range keys {
+		if err := newIdx.Insert(key, snap[key]); err != nil {
+			// Keep a still-usable index; only mark dirty if there was none.
+			if m.index == nil || m.state != StateReady {
+				m.state = StateDirty
+			}
+			return fmt.Errorf("rebuild insert %q: %w", key, err)
+		}
+	}
+	// Atomic publish: re-point only; do not Clear the old index.
+	m.index = newIdx
+	m.state = StateReady
+	m.mutationSinceBuild = 0
+	return nil
+}

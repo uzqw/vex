@@ -33,8 +33,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/uzqw/vex/internal/metrics"
 	"github.com/uzqw/vex/internal/protocol"
+	"github.com/uzqw/vex/internal/search"
 	"github.com/uzqw/vex/internal/storage"
-	"github.com/uzqw/vex/internal/vector"
 	"github.com/uzqw/vex/pkg/logger"
 )
 
@@ -56,7 +56,7 @@ var (
 	hnswSeed  = flag.Int64("hnsw-seed", 0, "HNSW RNG seed (0 uses random seed)")
 	showVer   = flag.Bool("version", false, "Show version and exit")
 	store     *storage.Storage
-	index     storage.Index
+	mgr       *search.Manager
 	log       *logger.Logger
 
 	// Version is set at build time via ldflags
@@ -110,22 +110,46 @@ func init() {
 		Level:  level,
 	})
 
-	// Initialize storage
+	// Initialize storage + search manager
 	store = storage.New()
-	switch strings.ToLower(*indexMode) {
-	case "none", "":
-		index = nil
-	case "bruteforce":
-		index = storage.NewBruteForceIndex()
-	case "hnsw", "auto":
-		index = storage.NewHNSWIndexWithConfig(storage.HNSWConfig{
+	hnswFactory := func() storage.Index {
+		return storage.NewHNSWIndexWithConfig(storage.HNSWConfig{
 			M:           *hnswM,
 			EfConstruct: *hnswEfC,
 			Ef:          *hnswEf,
 			Seed:        *hnswSeed,
 		})
+	}
+	var cfg search.Config
+	switch strings.ToLower(*indexMode) {
+	case "none", "":
+		cfg = search.Config{Mode: search.ModeNone}
+	case "bruteforce":
+		cfg = search.Config{
+			Mode:     search.ModeBruteForce,
+			NewIndex: func() storage.Index { return storage.NewBruteForceIndex() },
+		}
+	case "hnsw":
+		cfg = search.Config{
+			Mode:                   search.ModeHNSW,
+			NewIndex:               hnswFactory,
+			UseDefaultRebuildRatio: true,
+		}
+	case "auto":
+		cfg = search.Config{
+			Mode:                   search.ModeAuto,
+			AutoMin:                *autoMin,
+			NewIndex:               hnswFactory,
+			UseDefaultRebuildRatio: true,
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "invalid -index value %q; expected none, bruteforce, hnsw, or auto\n", *indexMode)
+		os.Exit(2)
+	}
+	var err error
+	mgr, err = search.NewManager(store, cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create search manager: %v\n", err)
 		os.Exit(2)
 	}
 }
@@ -318,7 +342,6 @@ func handleVSet(log *logger.Logger, writer *protocol.RESPWriter, cmd []string) {
 
 	key := cmd[1]
 	vectorStr := cmd[2]
-	_, existed := store.Get(key)
 
 	// Parse vector
 	values, err := protocol.FastVectorParser(vectorStr)
@@ -327,31 +350,13 @@ func handleVSet(log *logger.Logger, writer *protocol.RESPWriter, cmd []string) {
 		return
 	}
 
-	// Store vector
-	if err := store.Set(key, values); err != nil {
+	created, err := mgr.Set(key, values)
+	if err != nil {
 		_ = writer.WriteError(err.Error())
 		return
 	}
 
-	useIndex := index != nil
-	if strings.EqualFold(*indexMode, "auto") && store.Count() < *autoMin {
-		useIndex = false
-	}
-	if useIndex {
-		normalized, ok := store.Get(key)
-		if !ok {
-			_ = writer.WriteError("failed to read normalized vector after set")
-			return
-		}
-		// VSET is an upsert; remove any previous index entry before inserting.
-		_ = index.Delete(key)
-		if err := index.Insert(key, normalized); err != nil {
-			_ = writer.WriteError(fmt.Sprintf("failed to update index: %s", err.Error()))
-			return
-		}
-	}
-
-	if !existed {
+	if created {
 		metrics.Global().IncrementKeys()
 	}
 	_ = writer.WriteSimpleString("OK")
@@ -365,7 +370,7 @@ func handleVGet(writer *protocol.RESPWriter, cmd []string) {
 	}
 
 	key := cmd[1]
-	values, ok := store.Get(key)
+	values, ok := mgr.Get(key)
 	if !ok {
 		_ = writer.WriteBulkString("") // Null bulk string
 		return
@@ -393,11 +398,8 @@ func handleVDel(writer *protocol.RESPWriter, cmd []string) {
 	}
 
 	key := cmd[1]
-	deleted := store.Delete(key)
+	deleted := mgr.Delete(key)
 	if deleted {
-		if index != nil {
-			_ = index.Delete(key)
-		}
 		metrics.Global().DecrementKeys()
 		_ = writer.WriteInteger(1)
 	} else {
@@ -428,17 +430,7 @@ func handleVSearch(log *logger.Logger, writer *protocol.RESPWriter, cmd []string
 		return
 	}
 
-	var results []vector.SearchResult
-	if index != nil {
-		normalizedQuery, normalizeErr := vector.Normalize(query)
-		if normalizeErr != nil {
-			_ = writer.WriteError(fmt.Sprintf("failed to normalize query: %s", normalizeErr.Error()))
-			return
-		}
-		results, err = index.Search(normalizedQuery, k)
-	} else {
-		results, err = store.Search(query, k)
-	}
+	results, err := mgr.Search(query, k)
 	if err != nil {
 		_ = writer.WriteError(err.Error())
 		return
@@ -465,10 +457,7 @@ func handleStats(writer *protocol.RESPWriter) {
 
 // handleClear handles the CLEAR command
 func handleClear(writer *protocol.RESPWriter) {
-	store.Clear()
-	if index != nil {
-		index.Clear()
-	}
+	mgr.Clear()
 	_ = writer.WriteSimpleString("OK")
 }
 
