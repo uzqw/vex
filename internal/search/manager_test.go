@@ -300,9 +300,6 @@ func TestDeleteFailureMarksDirtyAndDoesNotReturnDeletedKey(t *testing.T) {
 			t.Fatalf("search returned deleted key a: %+v", res)
 		}
 	}
-	if m.State() == StateReady && m.IndexCount() > 0 {
-		// If rebuild somehow succeeded with empty failAfter=0 it wouldn't — good.
-	}
 }
 
 func TestIndexSearchFailureFallsBackAndMarksDirty(t *testing.T) {
