@@ -117,14 +117,14 @@ and published hnswlib/faiss L2 numbers are comparison-only.
 
 ## 7. Results
 
-Vex GIST1M (HNSW M=16, ef=600, efC=64, seed=1): **recall@10 = 0.8599** (cosine
-GT), **QPS = 300.29**, insert **1161.6 vec/s** on Intel Core Ultra 9 285H.
+Vex GIST1M (HNSW M=16, ef=1200, efC=64, seed=1): **recall@10 = 0.9063** (cosine
+GT), **QPS = 174.95**, insert **1362.6 vec/s** on Intel Core Ultra 9 285H.
 Full table and source citations:
 [`benchmarks/gist1m/comparison.md`](../benchmarks/gist1m/comparison.md).
 
 | Library | Metric | Config | recall@10 | QPS |
 |---|---|---|---:|---:|
-| **Vex** | cosine, L2-normalized | HNSW M=16, ef=600, efC=64, seed=1 | 0.8599 | 300.29 |
+| **Vex** | cosine, L2-normalized | HNSW M=16, ef=1200, efC=64, seed=1 | 0.9063 | 174.95 |
 | hnswlib | L2 | M=8, efC=500 | 0.4122 | 4017.66 |
 | hnsw(faiss) | L2 | M=8, efC=500, ef=20 | 0.3777 | 3317.49 |
 | hnswlib | L2 | M=24, efC=500 | 0.9899 | 194.78 |
