@@ -3,7 +3,8 @@
 
 Inserts the official 1M base vectors with VSET (key = 0-based index), runs the
 1,000 official queries with VSEARCH k=10, and reports mean recall@10 against
-the official ground truth plus QPS after a warmup pass.
+exact cosine on L2-normalized vectors (recomputed; official L2 .ivecs are not
+the ruler) plus QPS after a warmup pass.
 
 Usage:
     go run ./cmd/vex-server -index hnsw -hnsw-seed 1 -log-level warn
@@ -15,7 +16,13 @@ Writes results.json (committed artifact). Dataset files live in ./data/ (gitigno
 from __future__ import annotations
 
 import argparse
+import array
+import ctypes
+import ctypes.util
+import heapq
+import itertools
 import json
+import math
 import socket
 import sys
 import time
@@ -23,7 +30,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from prepare import DATA, FILES, find_file, iter_fvecs, iter_ivecs  # noqa: E402
+from prepare import DATA, FILES, find_file, iter_fvecs  # noqa: E402
 
 REPORT = HERE / "results.json"
 K = 10
@@ -48,10 +55,93 @@ def recall_at_k(pred: list[int], truth: list[int], k: int) -> float:
     return len(set(pred[:k]).intersection(truth[:k])) / k
 
 
+def _unit(v: list[float]) -> list[float] | None:
+    s = math.sqrt(sum(x * x for x in v))
+    if s == 0.0:
+        return None
+    return [x / s for x in v]
+
+
+def _dot_matrix(qpack: array.array, bpack: array.array, nq: int, nb: int, d: int) -> array.array:
+    libname = ctypes.util.find_library("openblaso") or "libopenblaso.so.0"
+    fn = ctypes.CDLL(libname).cblas_sgemm
+    fn.restype = None
+    fn.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_float,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_float,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    out = array.array("f", [0.0]) * (nq * nb)
+    fn(
+        101,
+        111,
+        112,  # RowMajor, NoTrans, Trans: scores = Q @ B.T
+        nq,
+        nb,
+        d,
+        ctypes.c_float(1.0),
+        qpack.buffer_info()[0],
+        d,
+        bpack.buffer_info()[0],
+        d,
+        ctypes.c_float(0.0),
+        out.buffer_info()[0],
+        nb,
+    )
+    return out
+
+
+def cosine_gt(queries: list[list[float]], base, k: int) -> list[list[int]]:
+    """Top-k ids by cosine on L2-normalized vectors. Skips zero base vectors."""
+    bpack = array.array("f")
+    ids: list[int] = []
+    d = len(queries[0])
+    for nseen, (i, vec) in enumerate(base, 1):
+        if len(vec) != d:
+            raise ValueError(f"base dim {len(vec)} != {d} at {i}")
+        u = _unit(vec)
+        if u is None:
+            continue
+        bpack.extend(u)
+        ids.append(i)
+        if nseen % 100_000 == 0:
+            print(f"  normalized {nseen} base vectors")
+    qpack = array.array("f")
+    for q in queries:
+        u = _unit(q)
+        if u is None:
+            raise ValueError("zero query")
+        qpack.extend(u)
+    nq, nb = len(queries), len(ids)
+    if nb == 0:
+        raise ValueError("no non-zero base vectors")
+    scores = _dot_matrix(qpack, bpack, nq, nb, d)
+    kk = min(k, nb)
+    out: list[list[int]] = []
+    for qi in range(nq):
+        best = heapq.nlargest(kk, range(nb), key=lambda j, qi=qi: (scores[qi * nb + j], -ids[j]))
+        out.append([ids[j] for j in best])
+    return out
+
+
 def _self_check() -> None:
     assert recall_at_k([1, 2, 3], [1, 2, 3], 3) == 1.0
     assert recall_at_k([9, 8, 7], [1, 2, 3], 3) == 0.0
     assert recall_at_k([1, 9], [1, 2], 2) == 0.5
+    # Raw-L2 nearest is id 0; cosine-on-normalized nearest is id 1.
+    gt = cosine_gt([[1.0, 0.0]], [(0, [1.0, 0.1]), (1, [100.0, 0.0])], k=1)
+    assert gt == [[1]], gt
 
 
 class VexClient:
@@ -125,17 +215,21 @@ def main() -> int:
     _self_check()
     base_path = find_file(DATA, FILES["base"][0])
     query_path = find_file(DATA, FILES["query"][0])
-    gt_path = find_file(DATA, FILES["groundtruth"][0])
 
-    print("loading queries + ground truth ...")
+    print("loading queries ...")
     queries = list(iter_fvecs(query_path))
-    groundtruth = list(iter_ivecs(gt_path))
-    if len(queries) != N_QUERY or len(groundtruth) != N_QUERY:
-        print(f"expected {N_QUERY} queries/gt, got {len(queries)}/{len(groundtruth)}", file=sys.stderr)
+    if len(queries) != N_QUERY:
+        print(f"expected {N_QUERY} queries, got {len(queries)}", file=sys.stderr)
         return 1
     if any(len(q) != DIM for q in queries):
         print("query dim mismatch", file=sys.stderr)
         return 1
+    print(f"computing cosine ground truth on first {args.n} base vectors ...")
+    groundtruth = cosine_gt(
+        queries,
+        enumerate(itertools.islice(iter_fvecs(base_path), args.n)),
+        args.k,
+    )
 
     client = VexClient(args.host, args.port)
     try:
@@ -216,12 +310,13 @@ def main() -> int:
         "search_seconds": round(search_secs, 1),
         "qps": round(qps, 2),
         "recall_at_10": round(recall, 4),
+        "groundtruth": "cosine_l2_normalized",
         "official_1m": official,
     }
     REPORT.write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
     if not official:
-        print("NOTE: n != 1M; recall@10 is not the official GIST1M figure", file=sys.stderr)
+        print("NOTE: n != 1M; recall@10 is vs cosine GT on the subset", file=sys.stderr)
     return 0
 
 
