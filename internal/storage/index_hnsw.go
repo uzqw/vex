@@ -24,23 +24,25 @@ import (
 	"github.com/uzqw/vex/internal/vector"
 )
 
-// HNSWNode represents a single vector in the HNSW graph
-type HNSWNode struct {
-	ID        string
-	Vector    []float32
-	Level     int               // Node's layer level (0 = bottom layer)
-	Neighbors [][]*HNSWNeighbor // Multi-layer neighbor lists: neighbors[layer] = [neighbor1, neighbor2, ...]
-	deleted   bool              // tombstone: set in Delete, checked during traversal
+const noNode int32 = -1
+
+// hnswNode is one vertex in the packed graph. Neighbors are indices into
+// HNSWIndex.nodes, not pointers — the pointer graph scattered at ~100k GIST
+// inserts (50–100k window 1199 vec/s vs 1356 bar).
+type hnswNode struct {
+	id        string
+	level     int
+	deleted   bool
+	neighbors [][]hnswEdge // neighbors[layer]
 }
 
-// HNSWNeighbor represents a link to another node with precomputed distance
-type HNSWNeighbor struct {
-	Node     *HNSWNode
-	Distance float32
+type hnswEdge struct {
+	idx  int32
+	dist float32
 }
 
 type candidate struct {
-	node     *HNSWNode
+	idx      int32
 	distance float32
 }
 
@@ -149,15 +151,17 @@ const maxAllowedLevel = 64
 // Space complexity: O(n * M) where M is the maximum number of neighbors per node.
 type HNSWIndex struct {
 	mu          sync.RWMutex
-	nodes       map[string]*HNSWNode // Map from key to node
-	entryPoint  *HNSWNode            // Entry point for search (highest level node)
-	maxLevel    int                  // Maximum layer level
-	dim         int                  // Vector dimension; 0 until first insert
-	levelMult   float32              // Multiplier for level assignment (typically 1.0/ln(2.0))
-	M           int                  // Maximum number of neighbors per layer (layer > 0)
-	EfConstruct int                  // Search width for construction
-	Ef          int                  // Search width for search queries
-	rng         *rand.Rand           // Per-index RNG, avoids global rand lock contention
+	nodes       []hnswNode // ponytail: deleted nodes leave holes; reuse slots if delete churn matters
+	vecs        []float32  // packed, node i at i*dim; holes unused
+	keys        map[string]int32
+	entry       int32 // noNode if empty
+	maxLevel    int
+	dim         int
+	levelMult   float32
+	M           int
+	EfConstruct int
+	Ef          int
+	rng         *rand.Rand
 }
 
 // HNSWConfig controls HNSW graph density and search breadth.
@@ -210,12 +214,13 @@ func NewHNSWIndex() *HNSWIndex {
 func NewHNSWIndexWithConfig(config HNSWConfig) *HNSWIndex {
 	config = config.withDefaults()
 	return &HNSWIndex{
-		nodes:       make(map[string]*HNSWNode),
+		keys:        make(map[string]int32),
+		entry:       noNode,
 		maxLevel:    0,
 		levelMult:   float32(1.0 / math.Log(2.0)),
-		M:           config.M,           // Maximum neighbors per layer (layer > 0); layer 0 uses 2*M
-		EfConstruct: config.EfConstruct, // Construction beam width
-		Ef:          config.Ef,          // Search beam width
+		M:           config.M,
+		EfConstruct: config.EfConstruct,
+		Ef:          config.Ef,
 		rng:         rand.New(rand.NewSource(config.Seed)),
 	}
 }
@@ -266,6 +271,23 @@ func distanceBetween(vec1, vec2 []float32) (float32, error) {
 	return -sim, nil
 }
 
+func (h *HNSWIndex) vecAt(i int32) []float32 {
+	off := int(i) * h.dim
+	return h.vecs[off : off+h.dim]
+}
+
+func (h *HNSWIndex) makeNeighborLists(level int) [][]hnswEdge {
+	nbs := make([][]hnswEdge, level+1)
+	for i := 0; i <= level; i++ {
+		capn := h.M
+		if i == 0 {
+			capn = h.M * 2
+		}
+		nbs[i] = make([]hnswEdge, 0, capn)
+	}
+	return nbs
+}
+
 // Insert adds a new vector to the HNSW index
 func (h *HNSWIndex) Insert(key string, vec []float32) error {
 	h.mu.Lock()
@@ -280,37 +302,33 @@ func (h *HNSWIndex) Insert(key string, vec []float32) error {
 		return fmt.Errorf("dimension mismatch: expected %d, got %d", h.dim, len(vec))
 	}
 
-	// Check if node already exists
-	if _, exists := h.nodes[key]; exists {
+	if _, exists := h.keys[key]; exists {
 		return fmt.Errorf("vector with key %q already exists", key)
 	}
 
-	// Own a copy so callers cannot mutate graph data.
-	stored := append([]float32(nil), vec...)
+	if h.dim == 0 {
+		h.dim = len(vec)
+	}
+	h.vecs = append(h.vecs, vec...) // copies; packed so graph walk is not N slice headers
 
-	// Create new node
 	level := h.assignLevel()
-	newNode := &HNSWNode{
-		ID:        key,
-		Vector:    stored,
-		Level:     level,
-		Neighbors: make([][]*HNSWNeighbor, level+1),
-	}
-	for i := 0; i <= level; i++ {
-		newNode.Neighbors[i] = make([]*HNSWNeighbor, 0)
-	}
+	idx := int32(len(h.nodes))
+	h.nodes = append(h.nodes, hnswNode{
+		id:        key,
+		level:     level,
+		neighbors: h.makeNeighborLists(level),
+	})
+	stored := h.vecAt(idx)
 
-	// If this is the first node
-	if h.entryPoint == nil {
-		h.dim = len(stored)
-		h.nodes[key] = newNode
-		h.entryPoint = newNode
+	if h.entry == noNode {
+		h.keys[key] = idx
+		h.entry = idx
 		h.maxLevel = level
 		return nil
 	}
 
 	oldMaxLevel := h.maxLevel
-	currentNearest := h.entryPoint
+	currentNearest := h.entry
 
 	// Greedy descent on layers that already exist in the graph.
 	// Layers above oldMaxLevel must not be searched or linked yet.
@@ -343,22 +361,16 @@ func (h *HNSWIndex) Insert(key string, vec []float32) error {
 			return err
 		}
 
-		for _, neighbor := range neighbors {
-			dist, err := distanceBetween(stored, neighbor.Vector)
+		for _, nbIdx := range neighbors {
+			dist, err := distanceBetween(stored, h.vecAt(nbIdx))
 			if err != nil {
 				return err
 			}
-			newNode.Neighbors[lc] = append(newNode.Neighbors[lc], &HNSWNeighbor{
-				Node:     neighbor,
-				Distance: dist,
-			})
+			h.nodes[idx].neighbors[lc] = append(h.nodes[idx].neighbors[lc], hnswEdge{idx: nbIdx, dist: dist})
 
-			if neighbor.Level >= lc {
-				neighbor.Neighbors[lc] = append(neighbor.Neighbors[lc], &HNSWNeighbor{
-					Node:     newNode,
-					Distance: dist,
-				})
-				if err := h.pruneNeighbors(neighbor, lc, mEffective); err != nil {
+			if h.nodes[nbIdx].level >= lc {
+				h.nodes[nbIdx].neighbors[lc] = append(h.nodes[nbIdx].neighbors[lc], hnswEdge{idx: idx, dist: dist})
+				if err := h.pruneNeighbors(nbIdx, lc, mEffective); err != nil {
 					return err
 				}
 			}
@@ -369,11 +381,11 @@ func (h *HNSWIndex) Insert(key string, vec []float32) error {
 		}
 	}
 
-	h.nodes[key] = newNode
+	h.keys[key] = idx
 
 	// Layers above oldMaxLevel stay empty; new node becomes entry point.
 	if level > h.maxLevel {
-		h.entryPoint = newNode
+		h.entry = idx
 		h.maxLevel = level
 	}
 
@@ -385,15 +397,14 @@ func (h *HNSWIndex) Search(query []float32, k int) ([]vector.SearchResult, error
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	if h.entryPoint == nil {
+	if h.entry == noNode {
 		return []vector.SearchResult{}, nil
 	}
 	if h.dim > 0 && len(query) != h.dim {
 		return nil, fmt.Errorf("dimension mismatch: expected %d, got %d", h.dim, len(query))
 	}
 
-	// Search from top layer to layer 0
-	currentNearest := h.entryPoint
+	currentNearest := h.entry
 
 	for lc := h.maxLevel; lc > 0; lc-- {
 		var err error
@@ -414,16 +425,15 @@ func (h *HNSWIndex) Search(query []float32, k int) ([]vector.SearchResult, error
 		return nil, err
 	}
 
-	// Extract top-k results
 	results := make([]vector.SearchResult, 0, k)
 	for i := 0; i < k && i < len(candidates); i++ {
-		distance, err := distanceBetween(query, candidates[i].Vector)
+		n := candidates[i]
+		distance, err := distanceBetween(query, h.vecAt(n))
 		if err != nil {
 			return nil, err
 		}
-		// distance is negative similarity, so negate it to get actual similarity
 		results = append(results, vector.SearchResult{
-			Key:        candidates[i].ID,
+			Key:        h.nodes[n].id,
 			Similarity: -distance,
 		})
 	}
@@ -431,68 +441,66 @@ func (h *HNSWIndex) Search(query []float32, k int) ([]vector.SearchResult, error
 	return results, nil
 }
 
-var visitedPool = sync.Pool{New: func() any { return make(map[*HNSWNode]bool, 128) }}
+var visitedPool = sync.Pool{New: func() any { return make(map[int32]bool, 128) }}
 
-func acquireVisited() map[*HNSWNode]bool {
-	m := visitedPool.Get().(map[*HNSWNode]bool)
+func acquireVisited() map[int32]bool {
+	m := visitedPool.Get().(map[int32]bool)
 	clear(m)
 	return m
 }
 
-func releaseVisited(m map[*HNSWNode]bool) {
+func releaseVisited(m map[int32]bool) {
 	visitedPool.Put(m)
 }
 
 // searchLayer performs a greedy search on a specific layer, returning the single closest node.
 // C (candidates) is a min-heap so we always expand the nearest node first.
 // W (working set) is a max-heap so we can cheaply evict the worst result.
-func (h *HNSWIndex) searchLayer(query []float32, entryPoint *HNSWNode, layer int, ef int) (*HNSWNode, float32, error) {
+func (h *HNSWIndex) searchLayer(query []float32, entry int32, layer int, ef int) (int32, float32, error) {
 	visited := acquireVisited()
 	defer releaseVisited(visited)
-	C := make(minHeap, 0, ef) // candidates: min-heap, closest at top
-	W := make(maxHeap, 0, ef) // working set: max-heap, furthest (worst) at top
+	C := make(minHeap, 0, ef)
+	W := make(maxHeap, 0, ef)
 
-	dist, err := distanceBetween(query, entryPoint.Vector)
+	dist, err := distanceBetween(query, h.vecAt(entry))
 	if err != nil {
-		return nil, 0, err
+		return noNode, 0, err
 	}
-	C.push(candidate{node: entryPoint, distance: dist})
-	W.push(candidate{node: entryPoint, distance: dist})
-	visited[entryPoint] = true
+	C.push(candidate{idx: entry, distance: dist})
+	W.push(candidate{idx: entry, distance: dist})
+	visited[entry] = true
 
-	// Track best inline instead of scanning W at the end
-	best, bestDist := entryPoint, dist
+	best, bestDist := entry, dist
 
 	for len(C) > 0 {
-		c := C[0].distance // min of C (nearest candidate)
-		f := W[0].distance // max of W (worst result in working set)
+		c := C[0].distance
+		f := W[0].distance
 		if c > f {
 			break
 		}
 
 		current := C.pop()
 
-		if current.node.Level >= layer {
-			for _, neighbor := range current.node.Neighbors[layer] {
-				nb := neighbor.Node
-				if visited[nb] || nb.deleted {
+		if h.nodes[current.idx].level >= layer {
+			for _, e := range h.nodes[current.idx].neighbors[layer] {
+				if visited[e.idx] || h.nodes[e.idx].deleted {
 					continue
 				}
-				visited[nb] = true
-				d, err := distanceBetween(query, nb.Vector)
+				visited[e.idx] = true
+				d, err := distanceBetween(query, h.vecAt(e.idx))
 				if err != nil {
-					return nil, 0, err
+					return noNode, 0, err
 				}
 
 				if d < W[0].distance || len(W) < ef {
-					C.push(candidate{node: nb, distance: d})
-					W.push(candidate{node: nb, distance: d})
+					C.push(candidate{idx: e.idx, distance: d})
+					W.push(candidate{idx: e.idx, distance: d})
 					if len(W) > ef {
 						W.pop()
 					}
 					if d < bestDist {
 						bestDist = d
-						best = nb
+						best = e.idx
 					}
 				}
 			}
@@ -504,58 +512,56 @@ func (h *HNSWIndex) searchLayer(query []float32, entryPoint *HNSWNode, layer int
 
 // searchLayerWithEf performs greedy search and returns up to ef candidates sorted closest-first.
 // C (candidates) is a min-heap; W (working set) is a max-heap.
-func (h *HNSWIndex) searchLayerWithEf(query []float32, entryPoint *HNSWNode, layer int, ef int) ([]*HNSWNode, error) {
+func (h *HNSWIndex) searchLayerWithEf(query []float32, entry int32, layer int, ef int) ([]int32, error) {
 	visited := acquireVisited()
 	defer releaseVisited(visited)
-	C := make(minHeap, 0, ef) // candidates: min-heap
-	W := make(maxHeap, 0, ef) // working set: max-heap
+	C := make(minHeap, 0, ef)
+	W := make(maxHeap, 0, ef)
 
-	dist, err := distanceBetween(query, entryPoint.Vector)
+	dist, err := distanceBetween(query, h.vecAt(entry))
 	if err != nil {
 		return nil, err
 	}
-	C.push(candidate{node: entryPoint, distance: dist})
-	W.push(candidate{node: entryPoint, distance: dist})
-	visited[entryPoint] = true
+	C.push(candidate{idx: entry, distance: dist})
+	W.push(candidate{idx: entry, distance: dist})
+	visited[entry] = true
 
 	for len(C) > 0 {
-		c := C[0].distance // nearest candidate
-		f := W[0].distance // furthest result (worst in W)
+		c := C[0].distance
+		f := W[0].distance
 		if c > f {
-			break // no candidate can improve W
+			break
 		}
 
 		current := C.pop()
 
-		if current.node.Level >= layer {
-			for _, neighbor := range current.node.Neighbors[layer] {
-				nb := neighbor.Node
-				if visited[nb] || nb.deleted {
+		if h.nodes[current.idx].level >= layer {
+			for _, e := range h.nodes[current.idx].neighbors[layer] {
+				if visited[e.idx] || h.nodes[e.idx].deleted {
 					continue
 				}
-				visited[nb] = true
-				d, err := distanceBetween(query, nb.Vector)
+				visited[e.idx] = true
+				d, err := distanceBetween(query, h.vecAt(e.idx))
 				if err != nil {
 					return nil, err
 				}
 
 				if d < W[0].distance || len(W) < ef {
-					C.push(candidate{node: nb, distance: d})
-					W.push(candidate{node: nb, distance: d})
+					C.push(candidate{idx: e.idx, distance: d})
+					W.push(candidate{idx: e.idx, distance: d})
 					if len(W) > ef {
-						W.pop() // evict furthest
+						W.pop()
 					}
 				}
 			}
 		}
 	}
 
-	// Drain W into a slice sorted closest-first, skipping any tombstoned nodes.
-	result := make([]*HNSWNode, len(W))
+	result := make([]int32, len(W))
 	write := len(W)
 	for i := len(W) - 1; i >= 0; i-- {
-		n := W.pop().node
-		if !n.deleted {
+		n := W.pop().idx
+		if !h.nodes[n].deleted {
 			write--
 			result[write] = n
 		}
@@ -571,7 +577,7 @@ func (h *HNSWIndex) searchLayerWithEf(query []float32, entryPoint *HNSWNode, lay
 //
 // keepPrunedConnections=true: if the heuristic leaves fewer than m neighbors we backfill
 // from the discarded set so the graph stays well-connected.
-func (h *HNSWIndex) selectNeighborsHeuristic(query []float32, candidates []*HNSWNode, m int) ([]*HNSWNode, error) {
+func (h *HNSWIndex) selectNeighborsHeuristic(query []float32, candidates []int32, m int) ([]int32, error) {
 	if len(candidates) <= m {
 		return candidates, nil
 	}
@@ -585,23 +591,21 @@ func (h *HNSWIndex) selectNeighborsHeuristic(query []float32, candidates []*HNSW
 		workSet = workSet[:m*3]
 	}
 
-	// candidates are already sorted closest-first from searchLayerWithEf
-	selected := make([]*HNSWNode, 0, m)
-	discarded := make([]*HNSWNode, 0, len(workSet))
+	selected := make([]int32, 0, m)
+	discarded := make([]int32, 0, len(workSet))
 
 	for _, e := range workSet {
 		if len(selected) >= m {
 			break
 		}
-		distQE, err := distanceBetween(query, e.Vector)
+		distQE, err := distanceBetween(query, h.vecAt(e))
 		if err != nil {
 			return nil, err
 		}
 
-		// e is dominated if any already-selected neighbor r is closer to e than q is
 		dominated := false
 		for _, r := range selected {
-			distER, err := distanceBetween(e.Vector, r.Vector)
+			distER, err := distanceBetween(h.vecAt(e), h.vecAt(r))
 			if err != nil {
 				return nil, err
 			}
@@ -618,7 +622,6 @@ func (h *HNSWIndex) selectNeighborsHeuristic(query []float32, candidates []*HNSW
 		}
 	}
 
-	// keepPrunedConnections: backfill with discarded so we reach m if possible
 	for _, e := range discarded {
 		if len(selected) >= m {
 			break
@@ -630,17 +633,17 @@ func (h *HNSWIndex) selectNeighborsHeuristic(query []float32, candidates []*HNSW
 }
 
 // pruneNeighbors trims a node's neighbor list to at most m closest entries.
-func (h *HNSWIndex) pruneNeighbors(node *HNSWNode, layer int, m int) error {
-	neighbors := node.Neighbors[layer]
+func (h *HNSWIndex) pruneNeighbors(idx int32, layer int, m int) error {
+	neighbors := h.nodes[idx].neighbors[layer]
 	if len(neighbors) <= m {
 		return nil
 	}
 
 	sort.Slice(neighbors, func(i, j int) bool {
-		return neighbors[i].Distance < neighbors[j].Distance
+		return neighbors[i].dist < neighbors[j].dist
 	})
 
-	node.Neighbors[layer] = neighbors[:m]
+	h.nodes[idx].neighbors[layer] = neighbors[:m]
 	return nil
 }
 
@@ -650,44 +653,44 @@ func (h *HNSWIndex) Delete(key string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	node, exists := h.nodes[key]
+	idx, exists := h.keys[key]
 	if !exists {
 		return fmt.Errorf("vector with key %q not found", key)
 	}
 
-	// Mark as deleted so concurrent/future traversals skip it immediately
-	node.deleted = true
+	h.nodes[idx].deleted = true
 
-	// fix 6: remove this node from every neighbor's adjacency list
-	for layer := 0; layer <= node.Level; layer++ {
-		for _, nb := range node.Neighbors[layer] {
-			if nb.Node.Level < layer {
+	for layer := 0; layer <= h.nodes[idx].level; layer++ {
+		for _, e := range h.nodes[idx].neighbors[layer] {
+			if h.nodes[e.idx].level < layer {
 				continue
 			}
-			list := nb.Node.Neighbors[layer]
+			list := h.nodes[e.idx].neighbors[layer]
 			newList := list[:0]
 			for _, n := range list {
-				if n.Node != node {
+				if n.idx != idx {
 					newList = append(newList, n)
 				}
 			}
-			nb.Node.Neighbors[layer] = newList
+			h.nodes[e.idx].neighbors[layer] = newList
 		}
 	}
 
-	delete(h.nodes, key)
-	if len(h.nodes) == 0 {
+	delete(h.keys, key)
+	if len(h.keys) == 0 {
 		h.dim = 0
 	}
 
-	// If the deleted node was the entry point, elect a new one at the highest level
-	if h.entryPoint == node {
-		h.entryPoint = nil
+	if h.entry == idx {
+		h.entry = noNode
 		h.maxLevel = 0
-		for _, n := range h.nodes {
-			if h.entryPoint == nil || n.Level > h.entryPoint.Level {
-				h.entryPoint = n
-				h.maxLevel = n.Level
+		for i := range h.nodes {
+			if h.nodes[i].deleted {
+				continue
+			}
+			if h.entry == noNode || h.nodes[i].level > h.nodes[h.entry].level {
+				h.entry = int32(i)
+				h.maxLevel = h.nodes[i].level
 			}
 		}
 	}
@@ -699,8 +702,10 @@ func (h *HNSWIndex) Delete(key string) error {
 func (h *HNSWIndex) Clear() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.nodes = make(map[string]*HNSWNode)
-	h.entryPoint = nil
+	h.nodes = nil
+	h.vecs = nil
+	h.keys = make(map[string]int32)
+	h.entry = noNode
 	h.maxLevel = 0
 	h.dim = 0
 }
@@ -710,11 +715,15 @@ func (h *HNSWIndex) Clear() {
 func (h *HNSWIndex) CheckLayerInvariant() error {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	for _, node := range h.nodes {
-		for layer := 0; layer <= node.Level; layer++ {
-			for _, nb := range node.Neighbors[layer] {
-				if nb.Node.Level < layer {
-					return fmt.Errorf("node %q layer %d neighbor %q has level %d", node.ID, layer, nb.Node.ID, nb.Node.Level)
+	for i := range h.nodes {
+		node := h.nodes[i]
+		if node.deleted {
+			continue
+		}
+		for layer := 0; layer <= node.level; layer++ {
+			for _, e := range node.neighbors[layer] {
+				if h.nodes[e.idx].level < layer {
+					return fmt.Errorf("node %q layer %d neighbor %q has level %d", node.id, layer, h.nodes[e.idx].id, h.nodes[e.idx].level)
 				}
 			}
 		}
@@ -726,7 +735,7 @@ func (h *HNSWIndex) CheckLayerInvariant() error {
 func (h *HNSWIndex) Count() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return len(h.nodes)
+	return len(h.keys)
 }
 
 // IndexStats contains statistics about the HNSW index
@@ -743,21 +752,23 @@ func (h *HNSWIndex) GetStats() IndexStats {
 	defer h.mu.RUnlock()
 
 	stats := IndexStats{
-		TotalVectors:      len(h.nodes),
+		TotalVectors:      len(h.keys),
 		MaxLevel:          h.maxLevel,
 		LayerDistribution: make(map[int]int),
 	}
 
-	// Count nodes at each layer
 	var totalNeighbors int
-	for _, node := range h.nodes {
-		for level := 0; level <= node.Level; level++ {
+	for i := range h.nodes {
+		node := h.nodes[i]
+		if node.deleted {
+			continue
+		}
+		for level := 0; level <= node.level; level++ {
 			stats.LayerDistribution[level]++
-			totalNeighbors += len(node.Neighbors[level])
+			totalNeighbors += len(node.neighbors[level])
 		}
 	}
 
-	// Calculate average neighbors
 	totalNodes := 0
 	for _, count := range stats.LayerDistribution {
 		totalNodes += count

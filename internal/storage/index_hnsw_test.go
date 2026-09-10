@@ -43,8 +43,8 @@ func TestNewHNSWIndex(t *testing.T) {
 	if h.Count() != 0 {
 		t.Errorf("Count() = %d on empty index, want 0", h.Count())
 	}
-	if h.entryPoint != nil {
-		t.Error("entryPoint should be nil on empty index")
+	if h.entry != noNode {
+		t.Error("entry should be noNode on empty index")
 	}
 }
 
@@ -72,7 +72,7 @@ func TestNewHNSWIndexWithConfig(t *testing.T) {
 
 func TestVisitedPoolClears(t *testing.T) {
 	m := acquireVisited()
-	m[&HNSWNode{ID: "x"}] = true
+	m[1] = true
 	releaseVisited(m)
 	m2 := acquireVisited()
 	if len(m2) != 0 {
@@ -106,8 +106,8 @@ func TestHNSWInsert(t *testing.T) {
 		if h.Count() != 1 {
 			t.Errorf("Count = %d, want 1", h.Count())
 		}
-		if h.entryPoint == nil {
-			t.Error("entryPoint is nil after first insert")
+		if h.entry == noNode {
+			t.Error("entry is noNode after first insert")
 		}
 	})
 
@@ -226,15 +226,15 @@ func TestHNSWDelete(t *testing.T) {
 		h := NewHNSWIndex()
 		_ = h.Insert("a", makeNormVec(1, 0, 0))
 		_ = h.Insert("b", makeNormVec(0, 1, 0))
-		ep := h.entryPoint
-		if err := h.Delete(ep.ID); err != nil {
+		ep := h.entry
+		if err := h.Delete(h.nodes[ep].id); err != nil {
 			t.Fatalf("Delete entry point error: %v", err)
 		}
-		if h.entryPoint == ep {
-			t.Error("entryPoint was not updated after deleting it")
+		if h.entry == ep {
+			t.Error("entry was not updated after deleting it")
 		}
-		if h.Count() > 0 && h.entryPoint == nil {
-			t.Error("entryPoint is nil but index is non-empty")
+		if h.Count() > 0 && h.entry == noNode {
+			t.Error("entry is noNode but index is non-empty")
 		}
 	})
 
@@ -247,8 +247,8 @@ func TestHNSWDelete(t *testing.T) {
 		if h.Count() != 0 {
 			t.Errorf("Count = %d after deleting last node, want 0", h.Count())
 		}
-		if h.entryPoint != nil {
-			t.Error("entryPoint should be nil after deleting last node")
+		if h.entry != noNode {
+			t.Error("entry should be noNode after deleting last node")
 		}
 		if err := h.Insert("b", makeNormVec(1, 0)); err != nil {
 			t.Fatalf("empty index should accept a new dimension: %v", err)
@@ -284,8 +284,8 @@ func TestHNSWClear(t *testing.T) {
 	if h.Count() != 0 {
 		t.Errorf("Count = %d after Clear, want 0", h.Count())
 	}
-	if h.entryPoint != nil {
-		t.Error("entryPoint should be nil after Clear")
+	if h.entry != noNode {
+		t.Error("entry should be noNode after Clear")
 	}
 	if h.maxLevel != 0 {
 		t.Errorf("maxLevel = %d after Clear, want 0", h.maxLevel)
@@ -327,14 +327,17 @@ func TestHNSWGetStats(t *testing.T) {
 // ---- selectNeighborsHeuristic -----------------------------------------------
 
 func TestSelectNeighborsHeuristic(t *testing.T) {
-	h := NewHNSWIndex()
-
-	makeNode := func(v ...float32) *HNSWNode {
-		return &HNSWNode{Vector: makeNormVec(v...)}
+	insert := func(h *HNSWIndex, id string, v ...float32) int32 {
+		t.Helper()
+		if err := h.Insert(id, makeNormVec(v...)); err != nil {
+			t.Fatal(err)
+		}
+		return h.keys[id]
 	}
 
 	t.Run("fewer candidates than m returns all", func(t *testing.T) {
-		candidates := []*HNSWNode{makeNode(1, 0), makeNode(0, 1)}
+		h := NewHNSWIndex()
+		candidates := []int32{insert(h, "a", 1, 0), insert(h, "b", 0, 1)}
 		got, err := h.selectNeighborsHeuristic(makeNormVec(1, 0), candidates, 5)
 		if err != nil {
 			t.Fatal(err)
@@ -345,9 +348,10 @@ func TestSelectNeighborsHeuristic(t *testing.T) {
 	})
 
 	t.Run("returns at most m neighbors", func(t *testing.T) {
-		candidates := make([]*HNSWNode, 20)
+		h := NewHNSWIndex()
+		candidates := make([]int32, 20)
 		for i := range candidates {
-			candidates[i] = makeNode(float32(i+1), 0)
+			candidates[i] = insert(h, fmt.Sprintf("k%d", i), float32(i+1), 0)
 		}
 		got, err := h.selectNeighborsHeuristic(makeNormVec(1, 0), candidates, 4)
 		if err != nil {
@@ -359,12 +363,12 @@ func TestSelectNeighborsHeuristic(t *testing.T) {
 	})
 
 	t.Run("backfills dominated candidates when not enough undominated", func(t *testing.T) {
-		// All candidates point in same direction → all dominated after first
+		h := NewHNSWIndex()
 		query := makeNormVec(1, 0, 0)
-		candidates := []*HNSWNode{
-			makeNode(1, 0, 0),
-			makeNode(0.99, 0.01, 0),
-			makeNode(0.98, 0.02, 0),
+		candidates := []int32{
+			insert(h, "a", 1, 0, 0),
+			insert(h, "b", 0.99, 0.01, 0),
+			insert(h, "c", 0.98, 0.02, 0),
 		}
 		got, err := h.selectNeighborsHeuristic(query, candidates, 3)
 		if err != nil {
@@ -381,39 +385,35 @@ func TestSelectNeighborsHeuristic(t *testing.T) {
 func TestPruneNeighbors(t *testing.T) {
 	h := NewHNSWIndex()
 
-	makeNeighbor := func(dist float32) *HNSWNeighbor {
-		return &HNSWNeighbor{Node: &HNSWNode{}, Distance: dist}
-	}
-
 	t.Run("no prune when within limit", func(t *testing.T) {
-		node := &HNSWNode{
-			Neighbors: [][]*HNSWNeighbor{
-				{makeNeighbor(0.1), makeNeighbor(0.2)},
+		h.nodes = []hnswNode{{
+			neighbors: [][]hnswEdge{
+				{{idx: 0, dist: 0.1}, {idx: 1, dist: 0.2}},
 			},
-		}
-		if err := h.pruneNeighbors(node, 0, 5); err != nil {
+		}}
+		if err := h.pruneNeighbors(0, 0, 5); err != nil {
 			t.Fatal(err)
 		}
-		if len(node.Neighbors[0]) != 2 {
-			t.Errorf("expected 2 neighbors, got %d", len(node.Neighbors[0]))
+		if len(h.nodes[0].neighbors[0]) != 2 {
+			t.Errorf("expected 2 neighbors, got %d", len(h.nodes[0].neighbors[0]))
 		}
 	})
 
 	t.Run("prune sorts and truncates", func(t *testing.T) {
-		node := &HNSWNode{
-			Neighbors: [][]*HNSWNeighbor{
-				{makeNeighbor(0.5), makeNeighbor(0.1), makeNeighbor(0.3), makeNeighbor(0.9)},
+		h.nodes = []hnswNode{{
+			neighbors: [][]hnswEdge{
+				{{idx: 0, dist: 0.5}, {idx: 1, dist: 0.1}, {idx: 2, dist: 0.3}, {idx: 3, dist: 0.9}},
 			},
-		}
-		if err := h.pruneNeighbors(node, 0, 2); err != nil {
+		}}
+		if err := h.pruneNeighbors(0, 0, 2); err != nil {
 			t.Fatal(err)
 		}
-		nb := node.Neighbors[0]
+		nb := h.nodes[0].neighbors[0]
 		if len(nb) != 2 {
 			t.Fatalf("expected 2 neighbors after prune, got %d", len(nb))
 		}
-		if nb[0].Distance != 0.1 || nb[1].Distance != 0.3 {
-			t.Errorf("wrong neighbors kept: %.1f, %.1f", nb[0].Distance, nb[1].Distance)
+		if nb[0].dist != 0.1 || nb[1].dist != 0.3 {
+			t.Errorf("wrong neighbors kept: %.1f, %.1f", nb[0].dist, nb[1].dist)
 		}
 	})
 }
@@ -465,7 +465,7 @@ func TestHNSWCopyAndDimCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 	v[0] = 0 // mutate caller slice
-	if got := h.nodes["a"].Vector[0]; got != orig0 {
+	if got := h.vecAt(h.keys["a"])[0]; got != orig0 {
 		t.Fatalf("index retained caller slice: got %v want %v", got, orig0)
 	}
 	if err := h.Insert("b", makeNormVec(1, 0)); err == nil {
