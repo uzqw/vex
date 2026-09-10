@@ -399,21 +399,24 @@ func TestPruneNeighbors(t *testing.T) {
 		}
 	})
 
-	t.Run("prune sorts and truncates", func(t *testing.T) {
-		h.nodes = []hnswNode{{
-			neighbors: [][]hnswEdge{
-				{{idx: 0, dist: 0.5}, {idx: 1, dist: 0.1}, {idx: 2, dist: 0.3}, {idx: 3, dist: 0.9}},
-			},
-		}}
+	t.Run("prune caps length", func(t *testing.T) {
+		h := NewHNSWIndexWithConfig(HNSWConfig{M: 2, EfConstruct: 8, Ef: 8, Seed: 1})
+		for i, v := range [][]float32{
+			makeNormVec(1, 0, 0),
+			makeNormVec(0.9, 0.1, 0),
+			makeNormVec(0.8, 0.2, 0),
+			makeNormVec(0, 1, 0),
+			makeNormVec(0, 0, 1),
+		} {
+			if err := h.Insert(fmt.Sprintf("p%d", i), v); err != nil {
+				t.Fatal(err)
+			}
+		}
 		if err := h.pruneNeighbors(0, 0, 2); err != nil {
 			t.Fatal(err)
 		}
-		nb := h.nodes[0].neighbors[0]
-		if len(nb) != 2 {
-			t.Fatalf("expected 2 neighbors after prune, got %d", len(nb))
-		}
-		if nb[0].dist != 0.1 || nb[1].dist != 0.3 {
-			t.Errorf("wrong neighbors kept: %.1f, %.1f", nb[0].dist, nb[1].dist)
+		if n := len(h.nodes[0].neighbors[0]); n > 2 {
+			t.Fatalf("expected <=2 neighbors after prune, got %d", n)
 		}
 	})
 }

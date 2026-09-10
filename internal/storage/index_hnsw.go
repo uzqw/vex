@@ -174,8 +174,8 @@ type HNSWConfig struct {
 
 const (
 	DefaultHNSWM           = 16
-	DefaultHNSWEfConstruct = 64 // 600 made GIST1M insert ~135 vec/s; search ef stays 600
-	DefaultHNSWEf          = 600
+	DefaultHNSWEfConstruct = 64 // 600 made GIST1M insert ~135 vec/s
+	DefaultHNSWEf          = 1200
 )
 
 // DefaultHNSWConfig returns the default HNSW configuration.
@@ -632,17 +632,42 @@ func (h *HNSWIndex) selectNeighborsHeuristic(query []float32, candidates []int32
 	return selected, nil
 }
 
-// pruneNeighbors trims a node's neighbor list to at most m closest entries.
+// pruneNeighbors trims a node's neighbor list to at most m entries.
+// Layer 0 m+1 reverse edges: keep the new edge only if it is not in the
+// shadow of an existing neighbor. Full heuristic on every overflow made
+// GIST insert ~2.7× slower; upper layers stay closest-M.
 func (h *HNSWIndex) pruneNeighbors(idx int32, layer int, m int) error {
 	neighbors := h.nodes[idx].neighbors[layer]
 	if len(neighbors) <= m {
 		return nil
 	}
 
+	if len(neighbors) == m+1 && layer == 0 {
+		neu := neighbors[m]
+		for _, e := range neighbors[:m] {
+			d, err := distanceBetween(h.vecAt(neu.idx), h.vecAt(e.idx))
+			if err != nil {
+				return err
+			}
+			if d < neu.dist {
+				h.nodes[idx].neighbors[layer] = neighbors[:m]
+				return nil
+			}
+		}
+		worst := 0
+		for i := 1; i < m; i++ {
+			if neighbors[i].dist > neighbors[worst].dist {
+				worst = i
+			}
+		}
+		neighbors[worst] = neu
+		h.nodes[idx].neighbors[layer] = neighbors[:m]
+		return nil
+	}
+
 	sort.Slice(neighbors, func(i, j int) bool {
 		return neighbors[i].dist < neighbors[j].dist
 	})
-
 	h.nodes[idx].neighbors[layer] = neighbors[:m]
 	return nil
 }
