@@ -63,25 +63,18 @@ change.
 - Run all 1,000 official query vectors with `VSEARCH ... k=10` (the official
   query set satisfies the "at least 1,000 queries" requirement).
 - **Recall@10:** for each query, the fraction of the 10 true nearest neighbors
-  (from the official ground truth) that appear in Vex's top-10 results.
-  Reported as the mean over all queries.
+  (exact cosine on L2-normalized vectors, recomputed) that appear in Vex's
+  top-10 results. Reported as the mean over all queries. Official L2 `.ivecs`
+  are not the ruler.
 - **QPS:** number of queries completed per second over the full query set,
   measured after a warmup pass.
 
 ### 3.4 Cosine search vs L2 ground truth
 
-Vex searches by cosine similarity (dot product on normalized vectors), while
-the official GIST1M ground truth is computed with L2 distance. This is
-compatible:
-
-> For unit vectors u and v, `||u − v||² = 2 − 2·cos(u, v)`, so L2 distance is
-> a strictly decreasing function of cosine similarity. Ranking by cosine
-> similarity therefore produces the identical ordering as ranking by L2
-> distance.
-
-Since Vex normalizes both stored vectors and the query
-(`internal/vector/vector.go`), the official L2 ground truth is valid for
-evaluating Vex's recall without any conversion.
+Vex searches by cosine on L2-normalized vectors. GIST1M base vectors are not
+unit length, so cosine ranking is not the same as raw L2. The success ruler
+is exact cosine on L2-normalized vectors (recomputed GT). Official L2 `.ivecs`
+and published hnswlib/faiss L2 numbers are comparison-only.
 
 ### 3.5 Reproducibility
 
@@ -124,19 +117,19 @@ evaluating Vex's recall without any conversion.
 
 ## 7. Results
 
-Vex GIST1M (HNSW M=16, ef=efC=600, seed=1): **recall@10 = 0.3479**, **QPS = 162.68**
-on Intel Core Ultra 9 285H. Full table and source citations:
+Vex GIST1M (HNSW M=16, ef=600, efC=64, seed=1): **recall@10 = 0.8599** (cosine
+GT), **QPS = 300.29**, insert **1161.6 vec/s** on Intel Core Ultra 9 285H.
+Full table and source citations:
 [`benchmarks/gist1m/comparison.md`](../benchmarks/gist1m/comparison.md).
 
-| Library | Config | recall@10 | QPS |
-|---|---|---:|---:|
-| **Vex** | HNSW M=16, ef=600, efC=600, seed=1 | 0.3479 | 162.68 |
-| hnswlib | M=8, efC=500 | 0.4122 | 4017.66 |
-| hnsw(faiss) | M=8, efC=500, ef=20 | 0.3777 | 3317.49 |
-| hnswlib | M=24, efC=500 | 0.9899 | 194.78 |
-| hnsw(faiss) | M=8, efC=500, ef=800 | 0.9534 | 149.58 |
+| Library | Metric | Config | recall@10 | QPS |
+|---|---|---|---:|---:|
+| **Vex** | cosine, L2-normalized | HNSW M=16, ef=600, efC=64, seed=1 | 0.8599 | 300.29 |
+| hnswlib | L2 | M=8, efC=500 | 0.4122 | 4017.66 |
+| hnsw(faiss) | L2 | M=8, efC=500, ef=20 | 0.3777 | 3317.49 |
+| hnswlib | L2 | M=24, efC=500 | 0.9899 | 194.78 |
+| hnsw(faiss) | L2 | M=8, efC=500, ef=800 | 0.9534 | 149.58 |
 
-Public rows are from
+Public rows are L2 from
 [gist-960-euclidean (k=10)](https://ann-benchmarks.com/gist-960-euclidean_10_euclidean.html).
-QPS is not comparable across machines; recall is. At similar recall, published
-HNSW is thousands of QPS; at similar QPS, published HNSW is recall@10 ≈ 0.95–0.99.
+QPS is not comparable across machines; recall is not the same metric.
