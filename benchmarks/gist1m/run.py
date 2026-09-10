@@ -208,7 +208,7 @@ def main() -> int:
     ap.add_argument("--index", default="hnsw", help="recorded server -index (metadata only)")
     ap.add_argument("--hnsw-m", type=int, default=16)
     ap.add_argument("--hnsw-ef", type=int, default=600)
-    ap.add_argument("--hnsw-ef-construction", type=int, default=600)
+    ap.add_argument("--hnsw-ef-construction", type=int, default=64)
     ap.add_argument("--hnsw-seed", type=int, default=1)
     args = ap.parse_args()
 

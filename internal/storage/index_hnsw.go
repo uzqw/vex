@@ -170,7 +170,7 @@ type HNSWConfig struct {
 
 const (
 	DefaultHNSWM           = 16
-	DefaultHNSWEfConstruct = 600
+	DefaultHNSWEfConstruct = 64 // 600 made GIST1M insert ~135 vec/s; search ef stays 600
 	DefaultHNSWEf          = 600
 )
 
@@ -431,11 +431,24 @@ func (h *HNSWIndex) Search(query []float32, k int) ([]vector.SearchResult, error
 	return results, nil
 }
 
+var visitedPool = sync.Pool{New: func() any { return make(map[*HNSWNode]bool, 128) }}
+
+func acquireVisited() map[*HNSWNode]bool {
+	m := visitedPool.Get().(map[*HNSWNode]bool)
+	clear(m)
+	return m
+}
+
+func releaseVisited(m map[*HNSWNode]bool) {
+	visitedPool.Put(m)
+}
+
 // searchLayer performs a greedy search on a specific layer, returning the single closest node.
 // C (candidates) is a min-heap so we always expand the nearest node first.
 // W (working set) is a max-heap so we can cheaply evict the worst result.
 func (h *HNSWIndex) searchLayer(query []float32, entryPoint *HNSWNode, layer int, ef int) (*HNSWNode, float32, error) {
-	visited := make(map[*HNSWNode]bool)
+	visited := acquireVisited()
+	defer releaseVisited(visited)
 	C := make(minHeap, 0, ef) // candidates: min-heap, closest at top
 	W := make(maxHeap, 0, ef) // working set: max-heap, furthest (worst) at top
 
@@ -492,7 +505,8 @@ func (h *HNSWIndex) searchLayer(query []float32, entryPoint *HNSWNode, layer int
 // searchLayerWithEf performs greedy search and returns up to ef candidates sorted closest-first.
 // C (candidates) is a min-heap; W (working set) is a max-heap.
 func (h *HNSWIndex) searchLayerWithEf(query []float32, entryPoint *HNSWNode, layer int, ef int) ([]*HNSWNode, error) {
-	visited := make(map[*HNSWNode]bool)
+	visited := acquireVisited()
+	defer releaseVisited(visited)
 	C := make(minHeap, 0, ef) // candidates: min-heap
 	W := make(maxHeap, 0, ef) // working set: max-heap
 

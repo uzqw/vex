@@ -70,6 +70,17 @@ func TestNewHNSWIndexWithConfig(t *testing.T) {
 	}
 }
 
+func TestVisitedPoolClears(t *testing.T) {
+	m := acquireVisited()
+	m[&HNSWNode{ID: "x"}] = true
+	releaseVisited(m)
+	m2 := acquireVisited()
+	if len(m2) != 0 {
+		t.Fatalf("pooled visited map not cleared: %d", len(m2))
+	}
+	releaseVisited(m2)
+}
+
 // ---- adaptiveEf -------------------------------------------------------------
 
 func TestAdaptiveEf(t *testing.T) {
