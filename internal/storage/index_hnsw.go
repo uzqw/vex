@@ -435,23 +435,48 @@ func (h *HNSWIndex) Search(query []float32, k int) ([]vector.SearchResult, error
 	return results, nil
 }
 
-var visitedPool = sync.Pool{New: func() any { return make(map[int32]bool, 128) }}
-
-func acquireVisited() map[int32]bool {
-	m := visitedPool.Get().(map[int32]bool)
-	clear(m)
-	return m
+// visitedList is hnswlib VisitedList: stamp[i]==cur means visited this search.
+// cur==0 is reserved so a zeroed array is unvisited. Grow by doubling (fixed max_elements in hnswlib).
+type visitedList struct {
+	mass []uint16
+	cur  uint16
 }
 
-func releaseVisited(m map[int32]bool) {
-	visitedPool.Put(m)
+func (v *visitedList) reset(n int) {
+	if n > cap(v.mass) {
+		c := cap(v.mass) * 2
+		if c < n {
+			c = n
+		}
+		v.mass = make([]uint16, c)
+		v.cur = 1
+		return
+	}
+	v.mass = v.mass[:cap(v.mass)]
+	v.cur++
+	if v.cur == 0 {
+		clear(v.mass)
+		v.cur = 1
+	}
+}
+
+var visitedPool = sync.Pool{New: func() any { return new(visitedList) }}
+
+func acquireVisited(n int) *visitedList {
+	v := visitedPool.Get().(*visitedList)
+	v.reset(n)
+	return v
+}
+
+func releaseVisited(v *visitedList) {
+	visitedPool.Put(v)
 }
 
 // searchLayer performs a greedy search on a specific layer, returning the single closest node.
 // C (candidates) is a min-heap so we always expand the nearest node first.
 // W (working set) is a max-heap so we can cheaply evict the worst result.
 func (h *HNSWIndex) searchLayer(query []float32, entry int32, layer int, ef int) (int32, float32, error) {
-	visited := acquireVisited()
+	visited := acquireVisited(len(h.nodes))
 	defer releaseVisited(visited)
 	C := make(minHeap, 0, ef)
 	W := make(maxHeap, 0, ef)
@@ -462,7 +487,7 @@ func (h *HNSWIndex) searchLayer(query []float32, entry int32, layer int, ef int)
 	}
 	C.push(candidate{idx: entry, distance: dist})
 	W.push(candidate{idx: entry, distance: dist})
-	visited[entry] = true
+	visited.mass[entry] = visited.cur
 
 	best, bestDist := entry, dist
 
@@ -477,10 +502,10 @@ func (h *HNSWIndex) searchLayer(query []float32, entry int32, layer int, ef int)
 
 		if h.nodes[current.idx].level >= layer {
 			for _, e := range h.nodes[current.idx].neighbors[layer] {
-				if visited[e.idx] || h.nodes[e.idx].deleted {
+				if visited.mass[e.idx] == visited.cur || h.nodes[e.idx].deleted {
 					continue
 				}
-				visited[e.idx] = true
+				visited.mass[e.idx] = visited.cur
 				d, err := distanceBetween(query, h.vecAt(e.idx))
 				if err != nil {
 					return noNode, 0, err
@@ -507,7 +532,7 @@ func (h *HNSWIndex) searchLayer(query []float32, entry int32, layer int, ef int)
 // searchLayerWithEf performs greedy search and returns up to ef candidates sorted closest-first.
 // C (candidates) is a min-heap; W (working set) is a max-heap.
 func (h *HNSWIndex) searchLayerWithEf(query []float32, entry int32, layer int, ef int) ([]candidate, error) {
-	visited := acquireVisited()
+	visited := acquireVisited(len(h.nodes))
 	defer releaseVisited(visited)
 	C := make(minHeap, 0, ef)
 	W := make(maxHeap, 0, ef)
@@ -518,7 +543,7 @@ func (h *HNSWIndex) searchLayerWithEf(query []float32, entry int32, layer int, e
 	}
 	C.push(candidate{idx: entry, distance: dist})
 	W.push(candidate{idx: entry, distance: dist})
-	visited[entry] = true
+	visited.mass[entry] = visited.cur
 
 	for len(C) > 0 {
 		c := C[0].distance
@@ -531,10 +556,10 @@ func (h *HNSWIndex) searchLayerWithEf(query []float32, entry int32, layer int, e
 
 		if h.nodes[current.idx].level >= layer {
 			for _, e := range h.nodes[current.idx].neighbors[layer] {
-				if visited[e.idx] || h.nodes[e.idx].deleted {
+				if visited.mass[e.idx] == visited.cur || h.nodes[e.idx].deleted {
 					continue
 				}
-				visited[e.idx] = true
+				visited.mass[e.idx] = visited.cur
 				d, err := distanceBetween(query, h.vecAt(e.idx))
 				if err != nil {
 					return nil, err

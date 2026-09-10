@@ -70,15 +70,33 @@ func TestNewHNSWIndexWithConfig(t *testing.T) {
 	}
 }
 
-func TestVisitedPoolClears(t *testing.T) {
-	m := acquireVisited()
-	m[1] = true
-	releaseVisited(m)
-	m2 := acquireVisited()
-	if len(m2) != 0 {
-		t.Fatalf("pooled visited map not cleared: %d", len(m2))
+func TestVisitedListResets(t *testing.T) {
+	v := acquireVisited(4)
+	v.mass[1] = v.cur
+	releaseVisited(v)
+	v2 := acquireVisited(4)
+	if v2.mass[1] == v2.cur {
+		t.Fatal("reset visited list still marks 1")
 	}
-	releaseVisited(m2)
+	releaseVisited(v2)
+
+	w := &visitedList{mass: make([]uint16, 4), cur: ^uint16(0)}
+	w.mass[1] = 1
+	w.reset(4)
+	if w.cur == 0 {
+		t.Fatal("cur reserved 0 after wrap")
+	}
+	if w.mass[1] == w.cur {
+		t.Fatal("wrap left old stamp visible")
+	}
+
+	g := &visitedList{}
+	g.reset(2)
+	g.mass[0] = g.cur
+	g.reset(8)
+	if g.mass[7] == g.cur {
+		t.Fatal("new slot marked after grow")
+	}
 }
 
 // ---- adaptiveEf -------------------------------------------------------------
