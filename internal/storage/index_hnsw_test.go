@@ -447,6 +447,37 @@ func TestComputeLevel(t *testing.T) {
 	}
 }
 
+func TestNewNodeL0DegreeIsM(t *testing.T) {
+	const m = 4
+	h := NewHNSWIndexWithConfig(HNSWConfig{M: m, EfConstruct: 32, Ef: 16, Seed: 1})
+	for i := 0; i < 40; i++ {
+		v := makeNormVec(float32(i%5+1), float32(i%3+1), float32(i%7+1), 1)
+		if err := h.Insert(fmt.Sprintf("n%d", i), v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	last := h.keys["n39"]
+	if n := len(h.nodes[last].neighbors[0]); n > m {
+		t.Fatalf("last node L0 degree = %d, want <= M=%d", n, m)
+	}
+	overM := 0
+	for i := range h.nodes {
+		if h.nodes[i].deleted {
+			continue
+		}
+		d := len(h.nodes[i].neighbors[0])
+		if d > 2*m {
+			t.Fatalf("node %d L0 degree = %d, want <= 2M=%d", i, d, 2*m)
+		}
+		if d > m {
+			overM++
+		}
+	}
+	if overM == 0 {
+		t.Fatal("no node grew past M via reverse L0 links")
+	}
+}
+
 func TestHNSWLayerInvariant(t *testing.T) {
 	h := NewHNSWIndexWithConfig(HNSWConfig{M: 4, EfConstruct: 32, Ef: 16, Seed: 7})
 	for i := 0; i < 80; i++ {

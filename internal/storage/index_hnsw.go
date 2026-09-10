@@ -347,16 +347,17 @@ func (h *HNSWIndex) Insert(key string, vec []float32) error {
 	}
 
 	for lc := startLayer; lc >= 0; lc-- {
-		mEffective := h.M
+		// New node always selects M; L0 reverse max stays 2M (hnswlib #116).
+		mRev := h.M
 		if lc == 0 {
-			mEffective = h.M * 2
+			mRev = h.M * 2
 		}
 
 		candidates, err := h.searchLayerWithEf(stored, currentNearest, lc, h.adaptiveEf(h.EfConstruct, len(stored)))
 		if err != nil {
 			return err
 		}
-		neighbors, err := h.selectNeighborsHeuristic(stored, candidates, mEffective)
+		neighbors, err := h.selectNeighborsHeuristic(stored, candidates, h.M)
 		if err != nil {
 			return err
 		}
@@ -370,7 +371,7 @@ func (h *HNSWIndex) Insert(key string, vec []float32) error {
 
 			if h.nodes[nbIdx].level >= lc {
 				h.nodes[nbIdx].neighbors[lc] = append(h.nodes[nbIdx].neighbors[lc], hnswEdge{idx: idx, dist: dist})
-				if err := h.pruneNeighbors(nbIdx, lc, mEffective); err != nil {
+				if err := h.pruneNeighbors(nbIdx, lc, mRev); err != nil {
 					return err
 				}
 			}
