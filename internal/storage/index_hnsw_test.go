@@ -326,6 +326,19 @@ func TestHNSWGetStats(t *testing.T) {
 
 // ---- selectNeighborsHeuristic -----------------------------------------------
 
+func asCands(t *testing.T, h *HNSWIndex, query []float32, ids []int32) []candidate {
+	t.Helper()
+	out := make([]candidate, len(ids))
+	for i, id := range ids {
+		d, err := distanceBetween(query, h.vecAt(id))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[i] = candidate{idx: id, distance: d}
+	}
+	return out
+}
+
 func TestSelectNeighborsHeuristic(t *testing.T) {
 	insert := func(h *HNSWIndex, id string, v ...float32) int32 {
 		t.Helper()
@@ -337,8 +350,9 @@ func TestSelectNeighborsHeuristic(t *testing.T) {
 
 	t.Run("fewer candidates than m returns all", func(t *testing.T) {
 		h := NewHNSWIndex()
-		candidates := []int32{insert(h, "a", 1, 0), insert(h, "b", 0, 1)}
-		got, err := h.selectNeighborsHeuristic(makeNormVec(1, 0), candidates, 5)
+		query := makeNormVec(1, 0)
+		candidates := asCands(t, h, query, []int32{insert(h, "a", 1, 0), insert(h, "b", 0, 1)})
+		got, err := h.selectNeighborsHeuristic(candidates, 5)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -349,11 +363,12 @@ func TestSelectNeighborsHeuristic(t *testing.T) {
 
 	t.Run("returns at most m neighbors", func(t *testing.T) {
 		h := NewHNSWIndex()
-		candidates := make([]int32, 20)
-		for i := range candidates {
-			candidates[i] = insert(h, fmt.Sprintf("k%d", i), float32(i+1), 0)
+		query := makeNormVec(1, 0)
+		ids := make([]int32, 20)
+		for i := range ids {
+			ids[i] = insert(h, fmt.Sprintf("k%d", i), float32(i+1), 0)
 		}
-		got, err := h.selectNeighborsHeuristic(makeNormVec(1, 0), candidates, 4)
+		got, err := h.selectNeighborsHeuristic(asCands(t, h, query, ids), 4)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -365,17 +380,37 @@ func TestSelectNeighborsHeuristic(t *testing.T) {
 	t.Run("backfills dominated candidates when not enough undominated", func(t *testing.T) {
 		h := NewHNSWIndex()
 		query := makeNormVec(1, 0, 0)
-		candidates := []int32{
+		candidates := asCands(t, h, query, []int32{
 			insert(h, "a", 1, 0, 0),
 			insert(h, "b", 0.99, 0.01, 0),
 			insert(h, "c", 0.98, 0.02, 0),
-		}
-		got, err := h.selectNeighborsHeuristic(query, candidates, 3)
+		})
+		got, err := h.selectNeighborsHeuristic(candidates, 3)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(got) == 0 {
 			t.Error("expected non-empty result with backfill")
+		}
+	})
+
+	t.Run("reuses candidate distance instead of recomputing", func(t *testing.T) {
+		h := NewHNSWIndex()
+		a := insert(h, "a", 1, 0)
+		b := insert(h, "b", 0.9, 0.1) // clustered with a
+		c := insert(h, "c", 0, 1)     // orthogonal to a
+		// Fake distQE=-0.5: b is closer to a than that (dominated), c is not.
+		// Recomputing vs query=a would keep b (true distQE≈-1) and drop c at m=2.
+		got, err := h.selectNeighborsHeuristic([]candidate{
+			{idx: a, distance: -0.5},
+			{idx: b, distance: -0.5},
+			{idx: c, distance: -0.5},
+		}, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 2 || got[0].idx != a || got[1].idx != c {
+			t.Fatalf("got %+v, want a then c", got)
 		}
 	})
 }

@@ -357,28 +357,25 @@ func (h *HNSWIndex) Insert(key string, vec []float32) error {
 		if err != nil {
 			return err
 		}
-		neighbors, err := h.selectNeighborsHeuristic(stored, candidates, h.M)
+		// hnswlib getNeighborsByHeuristic2 / mutuallyConnectNewElement keep search distances.
+		neighbors, err := h.selectNeighborsHeuristic(candidates, h.M)
 		if err != nil {
 			return err
 		}
 
-		for _, nbIdx := range neighbors {
-			dist, err := distanceBetween(stored, h.vecAt(nbIdx))
-			if err != nil {
-				return err
-			}
-			h.nodes[idx].neighbors[lc] = append(h.nodes[idx].neighbors[lc], hnswEdge{idx: nbIdx, dist: dist})
+		for _, nb := range neighbors {
+			h.nodes[idx].neighbors[lc] = append(h.nodes[idx].neighbors[lc], hnswEdge{idx: nb.idx, dist: nb.distance})
 
-			if h.nodes[nbIdx].level >= lc {
-				h.nodes[nbIdx].neighbors[lc] = append(h.nodes[nbIdx].neighbors[lc], hnswEdge{idx: idx, dist: dist})
-				if err := h.pruneNeighbors(nbIdx, lc, mRev); err != nil {
+			if h.nodes[nb.idx].level >= lc {
+				h.nodes[nb.idx].neighbors[lc] = append(h.nodes[nb.idx].neighbors[lc], hnswEdge{idx: idx, dist: nb.distance})
+				if err := h.pruneNeighbors(nb.idx, lc, mRev); err != nil {
 					return err
 				}
 			}
 		}
 
 		if len(neighbors) > 0 {
-			currentNearest = neighbors[0]
+			currentNearest = neighbors[0].idx
 		}
 	}
 
@@ -429,13 +426,9 @@ func (h *HNSWIndex) Search(query []float32, k int) ([]vector.SearchResult, error
 	results := make([]vector.SearchResult, 0, k)
 	for i := 0; i < k && i < len(candidates); i++ {
 		n := candidates[i]
-		distance, err := distanceBetween(query, h.vecAt(n))
-		if err != nil {
-			return nil, err
-		}
 		results = append(results, vector.SearchResult{
-			Key:        h.nodes[n].id,
-			Similarity: -distance,
+			Key:        h.nodes[n.idx].id,
+			Similarity: -n.distance,
 		})
 	}
 
@@ -513,7 +506,7 @@ func (h *HNSWIndex) searchLayer(query []float32, entry int32, layer int, ef int)
 
 // searchLayerWithEf performs greedy search and returns up to ef candidates sorted closest-first.
 // C (candidates) is a min-heap; W (working set) is a max-heap.
-func (h *HNSWIndex) searchLayerWithEf(query []float32, entry int32, layer int, ef int) ([]int32, error) {
+func (h *HNSWIndex) searchLayerWithEf(query []float32, entry int32, layer int, ef int) ([]candidate, error) {
 	visited := acquireVisited()
 	defer releaseVisited(visited)
 	C := make(minHeap, 0, ef)
@@ -558,11 +551,11 @@ func (h *HNSWIndex) searchLayerWithEf(query []float32, entry int32, layer int, e
 		}
 	}
 
-	result := make([]int32, len(W))
+	result := make([]candidate, len(W))
 	write := len(W)
 	for i := len(W) - 1; i >= 0; i-- {
-		n := W.pop().idx
-		if !h.nodes[n].deleted {
+		n := W.pop()
+		if !h.nodes[n.idx].deleted {
 			write--
 			result[write] = n
 		}
@@ -578,7 +571,8 @@ func (h *HNSWIndex) searchLayerWithEf(query []float32, entry int32, layer int, e
 //
 // keepPrunedConnections=true: if the heuristic leaves fewer than m neighbors we backfill
 // from the discarded set so the graph stays well-connected.
-func (h *HNSWIndex) selectNeighborsHeuristic(query []float32, candidates []int32, m int) ([]int32, error) {
+// Query-to-candidate distances come from search (hnswlib getNeighborsByHeuristic2).
+func (h *HNSWIndex) selectNeighborsHeuristic(candidates []candidate, m int) ([]candidate, error) {
 	if len(candidates) <= m {
 		return candidates, nil
 	}
@@ -592,25 +586,21 @@ func (h *HNSWIndex) selectNeighborsHeuristic(query []float32, candidates []int32
 		workSet = workSet[:m*3]
 	}
 
-	selected := make([]int32, 0, m)
-	discarded := make([]int32, 0, len(workSet))
+	selected := make([]candidate, 0, m)
+	discarded := make([]candidate, 0, len(workSet))
 
 	for _, e := range workSet {
 		if len(selected) >= m {
 			break
 		}
-		distQE, err := distanceBetween(query, h.vecAt(e))
-		if err != nil {
-			return nil, err
-		}
 
 		dominated := false
 		for _, r := range selected {
-			distER, err := distanceBetween(h.vecAt(e), h.vecAt(r))
+			distER, err := distanceBetween(h.vecAt(e.idx), h.vecAt(r.idx))
 			if err != nil {
 				return nil, err
 			}
-			if distER < distQE {
+			if distER < e.distance {
 				dominated = true
 				break
 			}
