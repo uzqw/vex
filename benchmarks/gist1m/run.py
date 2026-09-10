@@ -240,6 +240,23 @@ def main() -> int:
         batch: list[tuple[str, list[float]]] = []
         inserted = 0
         skipped: list[int] = []
+        pending = 0
+
+        def fire(items: list[tuple[str, list[float]]]) -> None:
+            nonlocal pending, inserted
+            payload = b"".join(encode(["VSET", key, fmt_vec(vec)]) for key, vec in items)
+            n = len(items)
+            if pending:
+                for _ in range(pending):
+                    client._read()
+                inserted += pending
+                if inserted % 10_000 < pending:
+                    elapsed = time.time() - t0
+                    rate = inserted / elapsed if elapsed else 0
+                    print(f"  inserted {inserted}/{args.n} ({rate:.0f} vec/s, {elapsed:.1f}s)")
+            client.sock.sendall(payload)
+            pending = n
+
         for i, vec in enumerate(iter_fvecs(base_path)):
             if i >= args.n:
                 break
@@ -253,16 +270,14 @@ def main() -> int:
                 continue
             batch.append((str(i), vec))
             if len(batch) >= args.batch:
-                client.vset_pipeline(batch)
-                inserted += len(batch)
+                fire(batch)
                 batch = []
-                if inserted % 10_000 == 0:
-                    elapsed = time.time() - t0
-                    rate = inserted / elapsed if elapsed else 0
-                    print(f"  inserted {inserted}/{args.n} ({rate:.0f} vec/s)")
         if batch:
-            client.vset_pipeline(batch)
-            inserted += len(batch)
+            fire(batch)
+        if pending:
+            for _ in range(pending):
+                client._read()
+            inserted += pending
         this_secs = time.time() - t0
         insert_secs = this_secs + args.prior_seconds
         zeros_before = sum(1 for s in skipped if s < args.start)

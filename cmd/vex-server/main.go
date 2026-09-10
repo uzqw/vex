@@ -219,6 +219,10 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 
 	connLog.Info("new connection", slog.String("remote", conn.RemoteAddr().String()))
 
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+	}
+
 	// Create RESP reader and writer
 	reader := protocol.NewRESPReader(conn)
 	writer := protocol.NewRESPWriter(conn)
@@ -279,10 +283,12 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 			slog.Duration("latency", latency),
 		)
 
-		// Flush response
-		if err := writer.Flush(); err != nil {
-			connLog.Error("failed to flush response", slog.String("error", err.Error()))
-			return
+		// Coalesce pipelined replies; last command in the kernel buffer still flushes.
+		if reader.Buffered() == 0 {
+			if err := writer.Flush(); err != nil {
+				connLog.Error("failed to flush response", slog.String("error", err.Error()))
+				return
+			}
 		}
 	}
 }

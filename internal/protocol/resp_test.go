@@ -22,6 +22,27 @@ import (
 	"testing"
 )
 
+func TestRESPReaderBufferedPipeline(t *testing.T) {
+	cmd := "*2\r\n$4\r\nPING\r\n$1\r\na\r\n"
+	r := NewRESPReader(strings.NewReader(cmd + cmd))
+	got, err := r.ReadCommand()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0] != "PING" {
+		t.Fatalf("got %v", got)
+	}
+	if r.Buffered() == 0 {
+		t.Fatal("expected leftover pipelined command in buffer")
+	}
+	if _, err := r.ReadCommand(); err != nil {
+		t.Fatal(err)
+	}
+	if r.Buffered() != 0 {
+		t.Fatalf("buffered %d after last command", r.Buffered())
+	}
+}
+
 func TestFastVectorParser(t *testing.T) {
 	tests := []struct {
 		name     string

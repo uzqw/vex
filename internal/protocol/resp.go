@@ -29,6 +29,9 @@ var (
 	ErrUnexpectedEOF   = errors.New("unexpected EOF while reading RESP")
 )
 
+// respReaderBuf holds a few pipelined VSET payloads (GIST vectors are ~11KiB).
+const respReaderBuf = 64 * 1024
+
 // RESPReader handles reading and parsing RESP protocol messages
 // Uses buffered I/O to reduce syscalls and improve performance
 type RESPReader struct {
@@ -38,8 +41,13 @@ type RESPReader struct {
 // NewRESPReader creates a new RESP reader
 func NewRESPReader(r io.Reader) *RESPReader {
 	return &RESPReader{
-		reader: bufio.NewReader(r),
+		reader: bufio.NewReaderSize(r, respReaderBuf),
 	}
+}
+
+// Buffered returns unread bytes already in the reader (pipelined commands).
+func (r *RESPReader) Buffered() int {
+	return r.reader.Buffered()
 }
 
 // ReadCommand reads and parses a RESP array command
