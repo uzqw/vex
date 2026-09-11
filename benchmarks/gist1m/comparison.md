@@ -16,7 +16,7 @@ reference hardware, so QPS is indicative only.
 
 | Library | Metric | Config | recall@10 | QPS |
 |---|---|---|---:|---:|
-| **Vex** | cosine, L2-normalized | HNSW M=16, ef=400, efC=64, seed=1 | 0.9284 | 412.35 |
+| **Vex** | cosine, L2-normalized | HNSW M=16, ef=400, efC=64, seed=1 | 0.9284 | 414.82 |
 | hnswlib | L2 | M=8, efC=500 (nearest published recall) | 0.2940 | 6164.27 |
 | hnswlib | L2 | M=8, efC=500 | 0.4122 | 4017.66 |
 | hnsw(faiss) | L2 | M=8, efC=500, ef=20 | 0.3777 | 3317.49 |
@@ -28,7 +28,7 @@ hnswlib chart labels omit the search `ef`; values are copied as published.
 
 ## Reading
 
-Vex inserted 999,990 / 1,000,000 base vectors in 619.1s (**1615.1 vec/s**;
+Vex inserted 999,990 / 1,000,000 base vectors in 618.3s (**1617.3 vec/s**;
 10 all-zero vectors skipped). 1,000 official queries, k=10, cosine GT.
 
 Public L2 rows are not a like-for-like recall comparison. QPS is not
