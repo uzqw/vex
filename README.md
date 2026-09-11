@@ -157,12 +157,15 @@ Returns `:1` if deleted, `:0` if key didn't exist.
 #### VSEARCH - Find similar vectors
 
 ```
-VSEARCH "[0.1, 0.2, 0.3, ...]" k [FILTER field=value]
+VSEARCH "[0.1, 0.2, 0.3, ...]" k [FILTER field=value] [WITHSCORES]
 ```
 
 `FILTER` restricts results to vectors whose metadata field equals the value
 (equality only). With HNSW the filter applies to candidates the beam visits,
 so a restrictive filter may return fewer than k results.
+
+`WITHSCORES` returns a flat `key, score, key, score, ...` array instead of
+plain keys (higher score = more similar).
 
 Example (find top 5 similar vectors):
 ```
@@ -177,6 +180,17 @@ VSEARCH "[0.12, 0.33, 0.95]" 5 FILTER color=red
 *1
 $5
 vec:2
+
+VSEARCH "[0.12, 0.33, 0.95]" 5 WITHSCORES
+*4
+$5
+vec:9
+$8
+0.987654
+$5
+vec:3
+$8
+0.954321
 ```
 
 #### CLEAR - Remove all vectors

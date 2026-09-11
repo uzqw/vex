@@ -27,6 +27,7 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -79,7 +80,17 @@ func init() {
 		fmt.Fprintf(os.Stderr, "\nFor more information, visit https://github.com/uzqw/vex\n")
 	}
 
-	flag.Parse()
+	// Skip flag parsing under `go test` so -test.* flags don't trip Parse.
+	testing := false
+	for _, arg := range os.Args[1:] {
+		if strings.HasPrefix(arg, "-test.") {
+			testing = true
+			break
+		}
+	}
+	if !testing {
+		flag.Parse()
+	}
 
 	// Handle version detection for 'go install'
 	if Version == "dev" {
@@ -498,9 +509,9 @@ func handleVDel(writer *protocol.RESPWriter, cmd []string) {
 }
 
 // handleVSearch handles the VSEARCH command:
-// VSEARCH "[0.1, 0.2, 0.3]" k [FILTER field=value]
+// VSEARCH "[0.1, 0.2, 0.3]" k [FILTER field=value] [WITHSCORES]
 // FILTER restricts results to vectors whose metadata has field == value
-// (equality only).
+// (equality only). WITHSCORES returns a flat key,score array.
 func handleVSearch(log *logger.Logger, writer *protocol.RESPWriter, cmd []string) {
 	if len(cmd) < 3 {
 		_ = writer.WriteError("wrong number of arguments for 'vsearch' command")
@@ -517,17 +528,31 @@ func handleVSearch(log *logger.Logger, writer *protocol.RESPWriter, cmd []string
 	}
 
 	var filterField, filterValue string
-	if len(cmd) >= 4 {
-		if len(cmd) != 5 || !strings.EqualFold(cmd[3], "FILTER") {
-			_ = writer.WriteError("syntax error: expected VSEARCH vector k [FILTER field=value]")
+	var withScores bool
+	for i := 3; i < len(cmd); i++ {
+		switch {
+		case strings.EqualFold(cmd[i], "WITHSCORES"):
+			if withScores {
+				_ = writer.WriteError("syntax error: WITHSCORES specified twice")
+				return
+			}
+			withScores = true
+		case strings.EqualFold(cmd[i], "FILTER"):
+			if filterField != "" || i+1 >= len(cmd) {
+				_ = writer.WriteError("syntax error: expected VSEARCH vector k [FILTER field=value] [WITHSCORES]")
+				return
+			}
+			field, value, ok := strings.Cut(cmd[i+1], "=")
+			if !ok || field == "" {
+				_ = writer.WriteError("invalid FILTER: expected field=value")
+				return
+			}
+			filterField, filterValue = field, value
+			i++
+		default:
+			_ = writer.WriteError("syntax error: expected VSEARCH vector k [FILTER field=value] [WITHSCORES]")
 			return
 		}
-		field, value, ok := strings.Cut(cmd[4], "=")
-		if !ok || field == "" {
-			_ = writer.WriteError("invalid FILTER: expected field=value")
-			return
-		}
-		filterField, filterValue = field, value
 	}
 
 	// Parse query vector
@@ -540,6 +565,16 @@ func handleVSearch(log *logger.Logger, writer *protocol.RESPWriter, cmd []string
 	results, err := mgr.SearchFiltered(query, k, filterField, filterValue)
 	if err != nil {
 		_ = writer.WriteError(err.Error())
+		return
+	}
+
+	if withScores {
+		// Flat key, score pairs (Redis convention)
+		elements := make([]string, 0, len(results)*2)
+		for _, res := range results {
+			elements = append(elements, res.Key, strconv.FormatFloat(float64(res.Similarity), 'f', -1, 32))
+		}
+		_ = writer.WriteArray(elements)
 		return
 	}
 
