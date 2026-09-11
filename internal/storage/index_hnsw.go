@@ -31,7 +31,6 @@ const noNode int32 = -1
 // inserts (50–100k window 1199 vec/s vs 1356 bar).
 type hnswNode struct {
 	id        string
-	vec       []float32 // aliases Insert's slice; Storage owns it on the VSET path
 	level     int
 	deleted   bool
 	neighbors [][]hnswEdge // neighbors[layer]
@@ -153,6 +152,7 @@ const maxAllowedLevel = 64
 type HNSWIndex struct {
 	mu          sync.RWMutex
 	nodes       []hnswNode // ponytail: deleted nodes leave holes; reuse slots if delete churn matters
+	vecs        []float32  // packed, node i at i*dim; holes unused
 	keys        map[string]int32
 	entry       int32 // noNode if empty
 	maxLevel    int
@@ -272,7 +272,19 @@ func distanceBetween(vec1, vec2 []float32) (float32, error) {
 }
 
 func (h *HNSWIndex) vecAt(i int32) []float32 {
-	return h.nodes[i].vec
+	off := int(i) * h.dim
+	return h.vecs[off : off+h.dim]
+}
+
+// Get returns the packed vector for key.
+func (h *HNSWIndex) Get(key string) ([]float32, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	idx, ok := h.keys[key]
+	if !ok {
+		return nil, false
+	}
+	return h.vecAt(idx), true
 }
 
 func (h *HNSWIndex) makeNeighborLists(level int) [][]hnswEdge {
@@ -308,16 +320,16 @@ func (h *HNSWIndex) Insert(key string, vec []float32) error {
 	if h.dim == 0 {
 		h.dim = len(vec)
 	}
+	h.vecs = append(h.vecs, vec...) // copies; packed so graph walk is not N slice headers
 
 	level := h.assignLevel()
 	idx := int32(len(h.nodes))
 	h.nodes = append(h.nodes, hnswNode{
 		id:        key,
-		vec:       vec, // ponytail: alias, not packed; pack+drop Storage copy if GIST QPS drops
 		level:     level,
 		neighbors: h.makeNeighborLists(level),
 	})
-	stored := vec
+	stored := h.vecAt(idx)
 
 	if h.entry == noNode {
 		h.keys[key] = idx
@@ -743,6 +755,7 @@ func (h *HNSWIndex) Clear() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.nodes = nil
+	h.vecs = nil
 	h.keys = make(map[string]int32)
 	h.entry = noNode
 	h.maxLevel = 0

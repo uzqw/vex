@@ -92,6 +92,14 @@ func (bf *BruteForceIndex) Search(query []float32, k int) ([]vector.SearchResult
 	return results, nil
 }
 
+// Get returns the stored vector for key.
+func (bf *BruteForceIndex) Get(key string) ([]float32, bool) {
+	bf.mu.RLock()
+	defer bf.mu.RUnlock()
+	v, ok := bf.data[key]
+	return v, ok
+}
+
 // Delete removes a vector from the index
 func (bf *BruteForceIndex) Delete(key string) error {
 	bf.mu.Lock()

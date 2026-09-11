@@ -25,6 +25,9 @@ type Index interface {
 	// Search finds the top-k most similar vectors to the query
 	Search(query []float32, k int) ([]vector.SearchResult, error)
 
+	// Get returns the stored vector for key.
+	Get(key string) ([]float32, bool)
+
 	// Delete removes a vector from the index
 	Delete(key string) error
 

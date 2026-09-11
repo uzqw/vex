@@ -108,6 +108,17 @@ func (s *Storage) Get(key string) ([]float32, bool) {
 	return val, ok
 }
 
+// DropVector keeps the key but releases the float32 body.
+// Used when the secondary index holds the packed vector.
+func (s *Storage) DropVector(key string) {
+	shard := s.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if _, ok := shard.data[key]; ok {
+		shard.data[key] = nil
+	}
+}
+
 // Delete removes a vector by key
 func (s *Storage) Delete(key string) bool {
 	shard := s.getShard(key)
@@ -162,6 +173,9 @@ func (s *Storage) Search(query []float32, k int) ([]vector.SearchResult, error) 
 
 			var results []vector.SearchResult
 			for key, vec := range shard.data {
+				if vec == nil {
+					continue
+				}
 				// Since both vectors are normalized, dot product = cosine similarity
 				similarity, err := vector.DotProduct(normalizedQuery, vec)
 				if err != nil {

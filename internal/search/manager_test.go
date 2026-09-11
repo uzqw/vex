@@ -623,3 +623,30 @@ func TestAutoRebuildFailureDoesNotFailSet(t *testing.T) {
 		t.Fatalf("fallback search got %d, want 2", len(res))
 	}
 }
+
+func TestHNSWDropsStorageCopy(t *testing.T) {
+	store := storage.New()
+	m, err := NewManager(store, Config{
+		Mode:               ModeHNSW,
+		NewIndex:           hnswFactory(),
+		RebuildDeleteRatio: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSet(t, m, "a", unit(3, 0, 0))
+	body, ok := store.Get("a")
+	if !ok {
+		t.Fatal("key missing from store")
+	}
+	if body != nil {
+		t.Fatal("storage still holds a vector body")
+	}
+	got, ok := m.Get("a")
+	if !ok {
+		t.Fatal("Get missed a")
+	}
+	if len(got) != 3 || got[0] < 0.99 {
+		t.Fatalf("got %v", got)
+	}
+}

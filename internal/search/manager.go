@@ -15,6 +15,7 @@
 package search
 
 import (
+	"container/heap"
 	"fmt"
 	"math"
 	"sort"
@@ -225,6 +226,9 @@ func (m *Manager) Search(query []float32, k int) ([]vector.SearchResult, error) 
 	m.mu.RUnlock()
 
 	if !useIndex {
+		if m.mode == ModeHNSW || (m.mode == ModeAuto && idx != nil) {
+			return m.searchResolved(query, k, idx)
+		}
 		return m.store.Search(query, k)
 	}
 
@@ -234,7 +238,7 @@ func (m *Manager) Search(query []float32, k int) ([]vector.SearchResult, error) 
 	}
 	results, err := idx.Search(normalized, k)
 	if err != nil {
-		fallback, ferr := m.store.Search(query, k)
+		fallback, ferr := m.fallbackSearch(query, k, idx)
 		if ferr != nil {
 			// Query/storage error, not an index fault.
 			return nil, err
@@ -270,8 +274,23 @@ func (m *Manager) Count() int {
 	return m.store.Count()
 }
 
-// Get returns a vector from storage.
+// Get returns a vector. HNSW/Auto may keep the body in the packed index.
 func (m *Manager) Get(key string) ([]float32, bool) {
+	v, ok := m.store.Get(key)
+	if !ok {
+		return nil, false
+	}
+	if v != nil {
+		return v, true
+	}
+	m.mu.RLock()
+	idx := m.index
+	m.mu.RUnlock()
+	if idx != nil {
+		if vec, ok := idx.Get(key); ok {
+			return vec, true
+		}
+	}
 	return m.store.Get(key)
 }
 
@@ -324,6 +343,9 @@ func (m *Manager) syncAfterSetLocked(key string, normalized []float32, existed b
 			m.state = StateDirty
 			return nil // storage already committed
 		}
+		if m.mode == ModeHNSW {
+			m.store.DropVector(key)
+		}
 		m.maybeRebuildLocked()
 		return nil
 
@@ -349,6 +371,7 @@ func (m *Manager) syncAfterSetLocked(key string, normalized []float32, existed b
 			m.state = StateDirty
 			return nil
 		}
+		m.store.DropVector(key)
 		m.maybeRebuildLocked()
 		return nil
 	}
@@ -378,6 +401,7 @@ func (m *Manager) maybeRebuildLocked() {
 // dropIndexLocked unpublishes the secondary index without Clear() so concurrent
 // Search calls holding the old pointer can finish safely.
 func (m *Manager) dropIndexLocked() {
+	m.restoreBodiesLocked()
 	m.index = nil
 	m.state = StateDormant
 	m.mutationSinceBuild = 0
@@ -398,7 +422,7 @@ func (m *Manager) rebuildFromStoreLocked() error {
 		return fmt.Errorf("no index factory configured")
 	}
 
-	snap := m.store.Snapshot()
+	snap := m.snapshotLocked()
 	keys := make([]string, 0, len(snap))
 	for k := range snap {
 		keys = append(keys, k)
@@ -419,5 +443,95 @@ func (m *Manager) rebuildFromStoreLocked() error {
 	m.index = newIdx
 	m.state = StateReady
 	m.mutationSinceBuild = 0
+	if m.mode == ModeHNSW || m.mode == ModeAuto {
+		for _, key := range keys {
+			m.store.DropVector(key)
+		}
+	}
 	return nil
+}
+
+func (m *Manager) fallbackSearch(query []float32, k int, idx storage.Index) ([]vector.SearchResult, error) {
+	if m.mode == ModeHNSW || m.mode == ModeAuto {
+		return m.searchResolved(query, k, idx)
+	}
+	return m.store.Search(query, k)
+}
+
+func (m *Manager) vecFor(key string, idx storage.Index) ([]float32, bool) {
+	vec, ok := m.store.Get(key)
+	if !ok {
+		return nil, false
+	}
+	if vec != nil {
+		return vec, true
+	}
+	if idx != nil {
+		if v, ok := idx.Get(key); ok {
+			return v, true
+		}
+	}
+	return m.store.Get(key)
+}
+
+func (m *Manager) searchResolved(query []float32, k int, idx storage.Index) ([]vector.SearchResult, error) {
+	normalizedQuery, err := vector.Normalize(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to normalize query: %w", err)
+	}
+	h := &vector.TopKHeap{}
+	heap.Init(h)
+	for _, key := range m.store.GetAllKeys() {
+		vec, ok := m.vecFor(key, idx)
+		if !ok {
+			continue
+		}
+		similarity, err := vector.DotProduct(normalizedQuery, vec)
+		if err != nil {
+			return nil, err
+		}
+		if h.Len() < k {
+			heap.Push(h, vector.SearchResult{Key: key, Similarity: similarity})
+		} else if k > 0 && similarity > (*h)[0].Similarity {
+			heap.Pop(h)
+			heap.Push(h, vector.SearchResult{Key: key, Similarity: similarity})
+		}
+	}
+	results := make([]vector.SearchResult, h.Len())
+	for i := len(results) - 1; i >= 0; i-- {
+		results[i] = heap.Pop(h).(vector.SearchResult)
+	}
+	return results, nil
+}
+
+func (m *Manager) snapshotLocked() map[string][]float32 {
+	keys := m.store.GetAllKeys()
+	out := make(map[string][]float32, len(keys))
+	for _, key := range keys {
+		vec, ok := m.vecFor(key, m.index)
+		if !ok {
+			continue
+		}
+		copied := make([]float32, len(vec))
+		copy(copied, vec)
+		out[key] = copied
+	}
+	return out
+}
+
+func (m *Manager) restoreBodiesLocked() {
+	if m.index == nil {
+		return
+	}
+	for _, key := range m.store.GetAllKeys() {
+		v, ok := m.store.Get(key)
+		if !ok || v != nil {
+			continue
+		}
+		vec, ok := m.index.Get(key)
+		if !ok {
+			continue
+		}
+		_ = m.store.Set(key, vec)
+	}
 }

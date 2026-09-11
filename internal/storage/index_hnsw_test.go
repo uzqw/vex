@@ -547,12 +547,13 @@ func TestHNSWLayerInvariant(t *testing.T) {
 func TestHNSWCopyAndDimCheck(t *testing.T) {
 	h := NewHNSWIndex()
 	v := makeNormVec(1, 0, 0)
+	orig0 := v[0]
 	if err := h.Insert("a", v); err != nil {
 		t.Fatal(err)
 	}
-	v[0] = 0 // mutate caller slice; Insert aliases, so the index sees it
-	if got := h.vecAt(h.keys["a"])[0]; got != 0 {
-		t.Fatalf("Insert should alias caller slice: got %v", got)
+	v[0] = 0 // mutate caller slice
+	if got := h.vecAt(h.keys["a"])[0]; got != orig0 {
+		t.Fatalf("index retained caller slice: got %v want %v", got, orig0)
 	}
 	if err := h.Insert("b", makeNormVec(1, 0)); err == nil {
 		t.Fatal("expected dimension mismatch")
