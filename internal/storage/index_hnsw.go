@@ -271,6 +271,12 @@ func distanceBetween(vec1, vec2 []float32) (float32, error) {
 	return -sim, nil
 }
 
+// distTo is distanceBetween for same-dim vectors: skips the per-call length
+// check and error branch on the search hot path (packed vecs all share h.dim).
+func (h *HNSWIndex) distTo(query []float32, i int32) float32 {
+	return -vector.DotProductASM(query, h.vecAt(i))
+}
+
 func (h *HNSWIndex) vecAt(i int32) []float32 {
 	off := int(i) * h.dim
 	return h.vecs[off : off+h.dim]
@@ -460,9 +466,10 @@ func (h *HNSWIndex) SearchWhere(query []float32, k int, allow func(key string) b
 
 // visitedList is hnswlib VisitedList: stamp[i]==cur means visited this search.
 // cur==0 is reserved so a zeroed array is unvisited. Grow by doubling (fixed max_elements in hnswlib).
+// uint32 stamps: the O(n) clear on cur wraparound now happens every ~4B searches, not ~65k.
 type visitedList struct {
-	mass []uint16
-	cur  uint16
+	mass []uint32
+	cur  uint32
 }
 
 func (v *visitedList) reset(n int) {
@@ -471,13 +478,13 @@ func (v *visitedList) reset(n int) {
 		if c < n {
 			c = n
 		}
-		v.mass = make([]uint16, c)
+		v.mass = make([]uint32, c)
 		v.cur = 1
 		return
 	}
 	v.mass = v.mass[:cap(v.mass)]
 	v.cur++
-	if v.cur == 0 {
+	if v.cur == 0 { // ponytail: unreachable in practice at uint32 width
 		clear(v.mass)
 		v.cur = 1
 	}
@@ -524,15 +531,16 @@ func (h *HNSWIndex) searchLayer(query []float32, entry int32, layer int, ef int)
 		current := C.pop()
 
 		if h.nodes[current.idx].level >= layer {
-			for _, e := range h.nodes[current.idx].neighbors[layer] {
+			nbs := h.nodes[current.idx].neighbors[layer]
+			for _, e := range nbs {
+				prefetch(h.vecAt(e.idx))
+			}
+			for _, e := range nbs {
 				if visited.mass[e.idx] == visited.cur || h.nodes[e.idx].deleted {
 					continue
 				}
 				visited.mass[e.idx] = visited.cur
-				d, err := distanceBetween(query, h.vecAt(e.idx))
-				if err != nil {
-					return noNode, 0, err
-				}
+				d := h.distTo(query, e.idx)
 
 				if d < W[0].distance || len(W) < ef {
 					C.push(candidate{idx: e.idx, distance: d})
@@ -578,15 +586,16 @@ func (h *HNSWIndex) searchLayerWithEf(query []float32, entry int32, layer int, e
 		current := C.pop()
 
 		if h.nodes[current.idx].level >= layer {
-			for _, e := range h.nodes[current.idx].neighbors[layer] {
+			nbs := h.nodes[current.idx].neighbors[layer]
+			for _, e := range nbs {
+				prefetch(h.vecAt(e.idx))
+			}
+			for _, e := range nbs {
 				if visited.mass[e.idx] == visited.cur || h.nodes[e.idx].deleted {
 					continue
 				}
 				visited.mass[e.idx] = visited.cur
-				d, err := distanceBetween(query, h.vecAt(e.idx))
-				if err != nil {
-					return nil, err
-				}
+				d := h.distTo(query, e.idx)
 
 				if d < W[0].distance || len(W) < ef {
 					C.push(candidate{idx: e.idx, distance: d})

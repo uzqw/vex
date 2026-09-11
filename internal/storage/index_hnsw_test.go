@@ -80,7 +80,7 @@ func TestVisitedListResets(t *testing.T) {
 	}
 	releaseVisited(v2)
 
-	w := &visitedList{mass: make([]uint16, 4), cur: ^uint16(0)}
+	w := &visitedList{mass: make([]uint32, 4), cur: ^uint32(0)}
 	w.mass[1] = 1
 	w.reset(4)
 	if w.cur == 0 {
