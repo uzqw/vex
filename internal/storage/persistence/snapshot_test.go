@@ -819,3 +819,77 @@ func TestSnapshotLoadWhenDimensionUnset(t *testing.T) {
 		}
 	}
 }
+
+// mockMetadataSource implements MetadataDataSource for testing.
+type mockMetadataSource struct {
+	mockDataSource
+	meta map[string]map[string]string
+}
+
+func (m *mockMetadataSource) GetAllMetadata() (map[string]map[string]string, error) {
+	return m.meta, nil
+}
+
+func (m *mockMetadataSource) SetAllVectorsWithMetadata(vectors map[string][]float32, meta map[string]map[string]string) error {
+	m.vectors = vectors
+	m.meta = meta
+	return nil
+}
+
+func TestSnapshotMetadataRoundTrip(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "vex-test-meta-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	src := &mockMetadataSource{
+		mockDataSource: mockDataSource{
+			vectors:   map[string][]float32{"a": {1, 0}, "b": {0, 1}},
+			dimension: 2,
+		},
+		meta: map[string]map[string]string{"a": {"color": "red"}},
+	}
+	cfg := Config{Enabled: true, DataDir: tempDir, Compression: "none", Checksum: true}
+
+	if err := NewVectorSnapshot(cfg, src).Save(context.Background()); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, "latest", "fields.json")); err != nil {
+		t.Fatalf("fields.json not written: %v", err)
+	}
+
+	dst := &mockMetadataSource{mockDataSource: mockDataSource{dimension: 2}}
+	if err := NewVectorSnapshot(cfg, dst).Load(context.Background()); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(dst.vectors) != 2 {
+		t.Fatalf("restored %d vectors, want 2", len(dst.vectors))
+	}
+	if dst.meta["a"]["color"] != "red" {
+		t.Fatalf("restored meta = %v", dst.meta)
+	}
+}
+
+func TestSnapshotLoadWithoutFieldsFile(t *testing.T) {
+	// Backward compat: a snapshot without fields.json still loads.
+	tempDir, err := os.MkdirTemp("", "vex-test-nofields-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	src := &mockDataSource{vectors: map[string][]float32{"a": {1, 0}}, dimension: 2}
+	cfg := Config{Enabled: true, DataDir: tempDir, Compression: "none", Checksum: true}
+	if err := NewVectorSnapshot(cfg, src).Save(context.Background()); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	dst := &mockMetadataSource{mockDataSource: mockDataSource{dimension: 2}}
+	if err := NewVectorSnapshot(cfg, dst).Load(context.Background()); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(dst.vectors) != 1 {
+		t.Fatalf("restored %d vectors, want 1", len(dst.vectors))
+	}
+}

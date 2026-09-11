@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -374,7 +375,9 @@ func handleEcho(writer *protocol.RESPWriter, cmd []string) {
 	_ = writer.WriteBulkString(cmd[1])
 }
 
-// handleVSet handles the VSET command: VSET key "[0.1, 0.2, 0.3]"
+// handleVSet handles the VSET command: VSET key "[0.1, 0.2, 0.3]" [json-metadata]
+// The optional third argument is a JSON object of scalar fields, e.g.
+// '{"color":"red","size":"3"}'. Values are stored as strings.
 func handleVSet(log *logger.Logger, writer *protocol.RESPWriter, cmd []string) {
 	if len(cmd) < 3 {
 		_ = writer.WriteError("wrong number of arguments for 'vset' command")
@@ -391,16 +394,62 @@ func handleVSet(log *logger.Logger, writer *protocol.RESPWriter, cmd []string) {
 		return
 	}
 
+	var meta map[string]string
+	if len(cmd) >= 4 {
+		meta, err = parseMetadata(cmd[3])
+		if err != nil {
+			_ = writer.WriteError(err.Error())
+			return
+		}
+	}
+
 	created, err := mgr.Set(key, values)
 	if err != nil {
 		_ = writer.WriteError(err.Error())
 		return
+	}
+	if len(cmd) >= 4 {
+		if err := mgr.SetMetadata(key, meta); err != nil {
+			_ = writer.WriteError(err.Error())
+			return
+		}
 	}
 
 	if created {
 		metrics.Global().IncrementKeys()
 	}
 	_ = writer.WriteSimpleString("OK")
+}
+
+// parseMetadata decodes a JSON object into scalar string fields. Numbers and
+// booleans are stringified; nested objects/arrays are rejected.
+func parseMetadata(s string) (map[string]string, error) {
+	var raw map[string]any
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
+	if err := dec.Decode(&raw); err != nil {
+		return nil, fmt.Errorf("invalid metadata JSON: %s", err.Error())
+	}
+	meta := make(map[string]string, len(raw))
+	for k, v := range raw {
+		switch t := v.(type) {
+		case string:
+			meta[k] = t
+		case json.Number:
+			meta[k] = t.String()
+		case bool:
+			if t {
+				meta[k] = "true"
+			} else {
+				meta[k] = "false"
+			}
+		case nil:
+			meta[k] = ""
+		default:
+			return nil, fmt.Errorf("metadata field %q must be a scalar", k)
+		}
+	}
+	return meta, nil
 }
 
 // handleVGet handles the VGET command: VGET key
@@ -448,7 +497,10 @@ func handleVDel(writer *protocol.RESPWriter, cmd []string) {
 	}
 }
 
-// handleVSearch handles the VSEARCH command: VSEARCH "[0.1, 0.2, 0.3]" k
+// handleVSearch handles the VSEARCH command:
+// VSEARCH "[0.1, 0.2, 0.3]" k [FILTER field=value]
+// FILTER restricts results to vectors whose metadata has field == value
+// (equality only).
 func handleVSearch(log *logger.Logger, writer *protocol.RESPWriter, cmd []string) {
 	if len(cmd) < 3 {
 		_ = writer.WriteError("wrong number of arguments for 'vsearch' command")
@@ -464,6 +516,20 @@ func handleVSearch(log *logger.Logger, writer *protocol.RESPWriter, cmd []string
 		return
 	}
 
+	var filterField, filterValue string
+	if len(cmd) >= 4 {
+		if len(cmd) != 5 || !strings.EqualFold(cmd[3], "FILTER") {
+			_ = writer.WriteError("syntax error: expected VSEARCH vector k [FILTER field=value]")
+			return
+		}
+		field, value, ok := strings.Cut(cmd[4], "=")
+		if !ok || field == "" {
+			_ = writer.WriteError("invalid FILTER: expected field=value")
+			return
+		}
+		filterField, filterValue = field, value
+	}
+
 	// Parse query vector
 	query, err := protocol.FastVectorParser(vectorStr)
 	if err != nil {
@@ -471,7 +537,7 @@ func handleVSearch(log *logger.Logger, writer *protocol.RESPWriter, cmd []string
 		return
 	}
 
-	results, err := mgr.Search(query, k)
+	results, err := mgr.SearchFiltered(query, k, filterField, filterValue)
 	if err != nil {
 		_ = writer.WriteError(err.Error())
 		return

@@ -48,6 +48,12 @@ func (bf *BruteForceIndex) Insert(key string, vec []float32) error {
 
 // Search scans all vectors and returns top-k results
 func (bf *BruteForceIndex) Search(query []float32, k int) ([]vector.SearchResult, error) {
+	return bf.SearchWhere(query, k, nil)
+}
+
+// SearchWhere scans all vectors and returns top-k results among keys allowed
+// by the predicate. A nil allow scans everything (exact filtered search).
+func (bf *BruteForceIndex) SearchWhere(query []float32, k int, allow func(key string) bool) ([]vector.SearchResult, error) {
 	bf.mu.RLock()
 	defer bf.mu.RUnlock()
 
@@ -61,6 +67,9 @@ func (bf *BruteForceIndex) Search(query []float32, k int) ([]vector.SearchResult
 
 	// Scan all vectors
 	for key, vec := range bf.data {
+		if allow != nil && !allow(key) {
+			continue
+		}
 		// Calculate similarity (both vectors are normalized, so dot product = cosine similarity)
 		similarity, err := vector.DotProduct(query, vec)
 		if err != nil {

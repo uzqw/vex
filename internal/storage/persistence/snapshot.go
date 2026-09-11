@@ -34,6 +34,7 @@ const (
 	// File names
 	metadataFile = "metadata.json"
 	vectorsFile  = "vectors.rdb"
+	fieldsFile   = "fields.json"
 
 	// Magic numbers for file format verification
 	vectorsMagic = "VEX\x00"
@@ -58,6 +59,20 @@ type VectorDataSource interface {
 
 	// GetDimension returns the vector dimension
 	GetDimension() int
+}
+
+// MetadataDataSource is an optional extension of VectorDataSource for
+// sources that also carry per-key scalar metadata. When the data source
+// implements it, snapshots persist metadata in a fields.json sidecar and
+// restore it after vectors. Sources without it snapshot vectors only.
+type MetadataDataSource interface {
+	VectorDataSource
+
+	// GetAllMetadata returns all key -> field -> value metadata.
+	GetAllMetadata() (map[string]map[string]string, error)
+
+	// SetAllVectorsWithMetadata replaces vectors and metadata during recovery.
+	SetAllVectorsWithMetadata(vectors map[string][]float32, meta map[string]map[string]string) error
 }
 
 // NewVectorSnapshot creates a new vector snapshot handler
@@ -96,6 +111,24 @@ func (s *VectorSnapshot) Save(ctx context.Context) error {
 	checksum, size, err := s.saveVectors(vectorsPath, vectors)
 	if err != nil {
 		return fmt.Errorf("failed to save vectors: %w", err)
+	}
+
+	// Save metadata sidecar when the source carries it
+	var fields map[string]map[string]string
+	if mds, ok := s.dataSource.(MetadataDataSource); ok {
+		fields, err = mds.GetAllMetadata()
+		if err != nil {
+			return fmt.Errorf("failed to get metadata: %w", err)
+		}
+		if len(fields) > 0 {
+			data, err := json.Marshal(fields)
+			if err != nil {
+				return fmt.Errorf("failed to encode metadata: %w", err)
+			}
+			if err := os.WriteFile(filepath.Join(tempDir, fieldsFile), data, 0644); err != nil {
+				return fmt.Errorf("failed to save metadata: %w", err)
+			}
+		}
 	}
 
 	// Create metadata
@@ -191,8 +224,23 @@ func (s *VectorSnapshot) Load(ctx context.Context) error {
 		)
 	}
 
-	// Restore vectors to data source
-	if err := s.dataSource.SetAllVectors(vectors); err != nil {
+	// Load metadata sidecar when present
+	var fields map[string]map[string]string
+	fieldsPath := filepath.Join(latestDir, fieldsFile)
+	if data, err := os.ReadFile(fieldsPath); err == nil {
+		if err := json.Unmarshal(data, &fields); err != nil {
+			return fmt.Errorf("failed to parse metadata: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read metadata: %w", err)
+	}
+
+	// Restore vectors (and metadata when the source supports it)
+	if mds, ok := s.dataSource.(MetadataDataSource); ok {
+		if err := mds.SetAllVectorsWithMetadata(vectors, fields); err != nil {
+			return fmt.Errorf("failed to restore vectors: %w", err)
+		}
+	} else if err := s.dataSource.SetAllVectors(vectors); err != nil {
 		return fmt.Errorf("failed to restore vectors: %w", err)
 	}
 

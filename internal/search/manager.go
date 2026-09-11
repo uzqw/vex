@@ -193,6 +193,28 @@ func (m *Manager) Set(key string, values []float32) (created bool, err error) {
 	return !existed, nil
 }
 
+// SetMetadata replaces the scalar metadata for an existing key.
+// A nil or empty meta clears it.
+func (m *Manager) SetMetadata(key string, meta map[string]string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.store.SetMetadata(key, meta)
+}
+
+// GetMetadata returns the scalar metadata for key (nil when none).
+func (m *Manager) GetMetadata(key string) (map[string]string, bool) {
+	return m.store.GetMetadata(key)
+}
+
+// GetAllMetadata returns copies of all key->metadata pairs. Keys without
+// metadata are omitted. Persistence snapshots use this alongside
+// GetAllVectors.
+func (m *Manager) GetAllMetadata() (map[string]map[string]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.store.MetadataSnapshot(), nil
+}
+
 // Delete removes a key from storage and the secondary index.
 func (m *Manager) Delete(key string) bool {
 	m.mu.Lock()
@@ -220,6 +242,20 @@ func (m *Manager) Delete(key string) bool {
 
 // Search finds top-k neighbors. Uses secondary index only when ready; otherwise Storage.
 func (m *Manager) Search(query []float32, k int) ([]vector.SearchResult, error) {
+	return m.SearchFiltered(query, k, "", "")
+}
+
+// SearchFiltered finds top-k neighbors restricted to keys whose metadata has
+// field == value. An empty field disables filtering. The predicate is applied
+// inside the search: brute-force paths scan only matching keys; HNSW applies
+// it when collecting results from the ef candidates visited at layer 0, so a
+// restrictive filter can return fewer than k results.
+func (m *Manager) SearchFiltered(query []float32, k int, field, value string) ([]vector.SearchResult, error) {
+	var allow func(string) bool
+	if field != "" {
+		allow = func(key string) bool { return m.store.Match(key, field, value) }
+	}
+
 	m.mu.RLock()
 	useIndex := m.index != nil && m.state == StateReady
 	idx := m.index
@@ -227,18 +263,18 @@ func (m *Manager) Search(query []float32, k int) ([]vector.SearchResult, error) 
 
 	if !useIndex {
 		if m.mode == ModeHNSW || (m.mode == ModeAuto && idx != nil) {
-			return m.searchResolved(query, k, idx)
+			return m.searchResolved(query, k, idx, allow)
 		}
-		return m.store.Search(query, k)
+		return m.storeSearch(query, k, allow)
 	}
 
 	normalized, err := vector.Normalize(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to normalize query: %w", err)
 	}
-	results, err := idx.Search(normalized, k)
+	results, err := idx.SearchWhere(normalized, k, allow)
 	if err != nil {
-		fallback, ferr := m.fallbackSearch(query, k, idx)
+		fallback, ferr := m.fallbackSearch(query, k, idx, allow)
 		if ferr != nil {
 			// Query/storage error, not an index fault.
 			return nil, err
@@ -250,6 +286,43 @@ func (m *Manager) Search(query []float32, k int) ([]vector.SearchResult, error) 
 		}
 		m.mu.Unlock()
 		return fallback, nil
+	}
+	return results, nil
+}
+
+// storeSearch is Storage.Search with an optional key predicate.
+func (m *Manager) storeSearch(query []float32, k int, allow func(string) bool) ([]vector.SearchResult, error) {
+	if allow == nil {
+		return m.store.Search(query, k)
+	}
+	normalizedQuery, err := vector.Normalize(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to normalize query: %w", err)
+	}
+	h := &vector.TopKHeap{}
+	heap.Init(h)
+	for _, key := range m.store.GetAllKeys() {
+		if !allow(key) {
+			continue
+		}
+		vec, ok := m.store.Get(key)
+		if !ok || vec == nil {
+			continue
+		}
+		similarity, err := vector.DotProduct(normalizedQuery, vec)
+		if err != nil {
+			return nil, err
+		}
+		if h.Len() < k {
+			heap.Push(h, vector.SearchResult{Key: key, Similarity: similarity})
+		} else if similarity > (*h)[0].Similarity {
+			heap.Pop(h)
+			heap.Push(h, vector.SearchResult{Key: key, Similarity: similarity})
+		}
+	}
+	results := make([]vector.SearchResult, h.Len())
+	for i := len(results) - 1; i >= 0; i-- {
+		results[i] = heap.Pop(h).(vector.SearchResult)
 	}
 	return results, nil
 }
@@ -297,9 +370,20 @@ func (m *Manager) GetAllVectors() (map[string][]float32, error) {
 // SetAllVectors bulk-restores vectors through Set so storage and the
 // secondary index stay consistent. Used by persistence recovery.
 func (m *Manager) SetAllVectors(vectors map[string][]float32) error {
+	return m.SetAllVectorsWithMetadata(vectors, nil)
+}
+
+// SetAllVectorsWithMetadata restores vectors and their scalar metadata.
+// Implements persistence.MetadataDataSource.
+func (m *Manager) SetAllVectorsWithMetadata(vectors map[string][]float32, meta map[string]map[string]string) error {
 	for key, vec := range vectors {
 		if _, err := m.Set(key, vec); err != nil {
 			return fmt.Errorf("failed to set vector %s: %w", key, err)
+		}
+		if fields, ok := meta[key]; ok {
+			if err := m.store.SetMetadata(key, fields); err != nil {
+				return fmt.Errorf("failed to set metadata %s: %w", key, err)
+			}
 		}
 	}
 	return nil
@@ -482,11 +566,11 @@ func (m *Manager) rebuildFromStoreLocked() error {
 	return nil
 }
 
-func (m *Manager) fallbackSearch(query []float32, k int, idx storage.Index) ([]vector.SearchResult, error) {
+func (m *Manager) fallbackSearch(query []float32, k int, idx storage.Index, allow func(string) bool) ([]vector.SearchResult, error) {
 	if m.mode == ModeHNSW || m.mode == ModeAuto {
-		return m.searchResolved(query, k, idx)
+		return m.searchResolved(query, k, idx, allow)
 	}
-	return m.store.Search(query, k)
+	return m.storeSearch(query, k, allow)
 }
 
 func (m *Manager) vecFor(key string, idx storage.Index) ([]float32, bool) {
@@ -505,7 +589,7 @@ func (m *Manager) vecFor(key string, idx storage.Index) ([]float32, bool) {
 	return m.store.Get(key)
 }
 
-func (m *Manager) searchResolved(query []float32, k int, idx storage.Index) ([]vector.SearchResult, error) {
+func (m *Manager) searchResolved(query []float32, k int, idx storage.Index, allow func(string) bool) ([]vector.SearchResult, error) {
 	normalizedQuery, err := vector.Normalize(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to normalize query: %w", err)
@@ -513,6 +597,9 @@ func (m *Manager) searchResolved(query []float32, k int, idx storage.Index) ([]v
 	h := &vector.TopKHeap{}
 	heap.Init(h)
 	for _, key := range m.store.GetAllKeys() {
+		if allow != nil && !allow(key) {
+			continue
+		}
 		vec, ok := m.vecFor(key, idx)
 		if !ok {
 			continue

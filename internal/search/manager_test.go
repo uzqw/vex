@@ -186,6 +186,10 @@ func (s *searchFailIndex) Search(query []float32, k int) ([]vector.SearchResult,
 	return nil, fmt.Errorf("injected search failure")
 }
 
+func (s *searchFailIndex) SearchWhere(query []float32, k int, allow func(string) bool) ([]vector.SearchResult, error) {
+	return nil, fmt.Errorf("injected search failure")
+}
+
 // blockingIndex blocks Search until release is closed, then returns base results.
 type blockingIndex struct {
 	storage.Index
@@ -195,6 +199,10 @@ type blockingIndex struct {
 }
 
 func (b *blockingIndex) Search(query []float32, k int) ([]vector.SearchResult, error) {
+	return b.SearchWhere(query, k, nil)
+}
+
+func (b *blockingIndex) SearchWhere(query []float32, k int, allow func(string) bool) ([]vector.SearchResult, error) {
 	select {
 	case b.entered <- struct{}{}:
 	default:
@@ -203,7 +211,7 @@ func (b *blockingIndex) Search(query []float32, k int) ([]vector.SearchResult, e
 	if b.cleared.Load() {
 		return []vector.SearchResult{}, nil
 	}
-	return b.Index.Search(query, k)
+	return b.Index.SearchWhere(query, k, allow)
 }
 
 func (b *blockingIndex) Clear() {
@@ -719,5 +727,141 @@ func TestSetAllVectorsRestoresAndIndexes(t *testing.T) {
 	}
 	if err := m.SetAllVectors(map[string][]float32{"bad": unit(1, 2)}); err == nil {
 		t.Fatal("expected dimension error for mismatched vector")
+	}
+}
+
+func TestSearchFilteredEquality(t *testing.T) {
+	for _, mode := range []Mode{ModeNone, ModeBruteForce, ModeHNSW, ModeAuto} {
+		m, err := NewManager(storage.New(), Config{
+			Mode:     mode,
+			AutoMin:  2,
+			NewIndex: hnswFactory(),
+		})
+		if err != nil {
+			t.Fatalf("mode %v: %v", mode, err)
+		}
+		mustSet(t, m, "red1", unit(1, 0, 0))
+		mustSet(t, m, "red2", unit(0.9, 0.1, 0))
+		mustSet(t, m, "blue1", unit(0.8, 0.2, 0))
+		for _, k := range []string{"red1", "red2"} {
+			if err := m.SetMetadata(k, map[string]string{"color": "red"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := m.SetMetadata("blue1", map[string]string{"color": "blue"}); err != nil {
+			t.Fatal(err)
+		}
+
+		res, err := m.SearchFiltered(unit(1, 0, 0), 3, "color", "red")
+		if err != nil {
+			t.Fatalf("mode %v: %v", mode, err)
+		}
+		if len(res) != 2 {
+			t.Fatalf("mode %v: got %d results, want 2: %v", mode, len(res), res)
+		}
+		for _, r := range res {
+			if r.Key == "blue1" {
+				t.Fatalf("mode %v: filter leaked non-matching key: %v", mode, res)
+			}
+		}
+
+		// No match at all → empty.
+		res, err = m.SearchFiltered(unit(1, 0, 0), 3, "color", "green")
+		if err != nil {
+			t.Fatalf("mode %v: %v", mode, err)
+		}
+		if len(res) != 0 {
+			t.Fatalf("mode %v: got %v, want empty", mode, res)
+		}
+
+		// Empty field disables filtering.
+		res, err = m.SearchFiltered(unit(1, 0, 0), 3, "", "")
+		if err != nil {
+			t.Fatalf("mode %v: %v", mode, err)
+		}
+		if len(res) != 3 {
+			t.Fatalf("mode %v: unfiltered got %d, want 3", mode, len(res))
+		}
+	}
+}
+
+func TestMetadataLifecycle(t *testing.T) {
+	m, err := NewManager(storage.New(), Config{Mode: ModeNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSet(t, m, "a", unit(1, 0, 0))
+
+	if meta, ok := m.GetMetadata("a"); !ok || meta != nil {
+		t.Fatalf("expected nil metadata, got %v ok=%v", meta, ok)
+	}
+	if err := m.SetMetadata("missing", map[string]string{"x": "y"}); err == nil {
+		t.Fatal("expected error setting metadata on missing key")
+	}
+	if err := m.SetMetadata("a", map[string]string{"color": "red", "n": "3"}); err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := m.GetMetadata("a")
+	if !ok || meta["color"] != "red" || meta["n"] != "3" {
+		t.Fatalf("metadata = %v ok=%v", meta, ok)
+	}
+
+	// Clear by empty map.
+	if err := m.SetMetadata("a", nil); err != nil {
+		t.Fatal(err)
+	}
+	if meta, ok := m.GetMetadata("a"); !ok || meta != nil {
+		t.Fatalf("expected cleared metadata, got %v", meta)
+	}
+
+	// Delete removes metadata.
+	if err := m.SetMetadata("a", map[string]string{"color": "red"}); err != nil {
+		t.Fatal(err)
+	}
+	m.Delete("a")
+	mustSet(t, m, "a", unit(1, 0, 0))
+	if meta, _ := m.GetMetadata("a"); meta != nil {
+		t.Fatalf("metadata survived delete: %v", meta)
+	}
+}
+
+func TestMetadataSnapshotRoundTrip(t *testing.T) {
+	m, err := NewManager(storage.New(), Config{Mode: ModeNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSet(t, m, "a", unit(1, 0, 0))
+	mustSet(t, m, "b", unit(0, 1, 0))
+	if err := m.SetMetadata("a", map[string]string{"color": "red"}); err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := m.GetAllMetadata()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(meta) != 1 || meta["a"]["color"] != "red" {
+		t.Fatalf("GetAllMetadata = %v", meta)
+	}
+	meta["a"]["color"] = "mutated"
+	if got, _ := m.GetMetadata("a"); got["color"] != "red" {
+		t.Fatal("GetAllMetadata aliased internal metadata")
+	}
+
+	m2, err := NewManager(storage.New(), Config{Mode: ModeNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vecs, _ := m.GetAllVectors()
+	allMeta, _ := m.GetAllMetadata()
+	if err := m2.SetAllVectorsWithMetadata(vecs, allMeta); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := m2.GetMetadata("a")
+	if !ok || got["color"] != "red" {
+		t.Fatalf("restored metadata = %v ok=%v", got, ok)
+	}
+	if got, _ := m2.GetMetadata("b"); got != nil {
+		t.Fatalf("unexpected metadata on b: %v", got)
 	}
 }

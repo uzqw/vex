@@ -403,6 +403,14 @@ func (h *HNSWIndex) Insert(key string, vec []float32) error {
 
 // Search finds the top-k most similar vectors
 func (h *HNSWIndex) Search(query []float32, k int) ([]vector.SearchResult, error) {
+	return h.SearchWhere(query, k, nil)
+}
+
+// SearchWhere finds top-k among keys allowed by the predicate. The beam
+// still traverses the full graph; allow is applied only when collecting
+// results from the ef candidates visited at layer 0, so a restrictive
+// predicate can return fewer than k results.
+func (h *HNSWIndex) SearchWhere(query []float32, k int, allow func(key string) bool) ([]vector.SearchResult, error) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
@@ -435,10 +443,14 @@ func (h *HNSWIndex) Search(query []float32, k int) ([]vector.SearchResult, error
 	}
 
 	results := make([]vector.SearchResult, 0, k)
-	for i := 0; i < k && i < len(candidates); i++ {
+	for i := 0; i < len(candidates) && len(results) < k; i++ {
 		n := candidates[i]
+		key := h.nodes[n.idx].id
+		if allow != nil && !allow(key) {
+			continue
+		}
 		results = append(results, vector.SearchResult{
-			Key:        h.nodes[n.idx].id,
+			Key:        key,
 			Similarity: -n.distance,
 		})
 	}

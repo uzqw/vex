@@ -118,12 +118,18 @@ sudo pacman -S redis
 #### VSET - Store a vector
 
 ```
-VSET key "[0.1, 0.2, 0.3, ...]"
+VSET key "[0.1, 0.2, 0.3, ...]" [json-metadata]
 ```
+
+The optional third argument is a JSON object of scalar fields stored alongside
+the vector (numbers and booleans are stored as their string form).
 
 Example:
 ```
 VSET vec:1 "[0.12, 0.33, 0.95]"
++OK
+
+VSET vec:2 "[0.5, 0.4, 0.1]" '{"color":"red","size":"3"}'
 +OK
 ```
 
@@ -151,8 +157,12 @@ Returns `:1` if deleted, `:0` if key didn't exist.
 #### VSEARCH - Find similar vectors
 
 ```
-VSEARCH "[0.1, 0.2, 0.3, ...]" k
+VSEARCH "[0.1, 0.2, 0.3, ...]" k [FILTER field=value]
 ```
+
+`FILTER` restricts results to vectors whose metadata field equals the value
+(equality only). With HNSW the filter applies to candidates the beam visits,
+so a restrictive filter may return fewer than k results.
 
 Example (find top 5 similar vectors):
 ```
@@ -162,6 +172,11 @@ $5
 vec:9
 $5
 vec:3
+
+VSEARCH "[0.12, 0.33, 0.95]" 5 FILTER color=red
+*1
+$5
+vec:2
 ```
 
 #### CLEAR - Remove all vectors

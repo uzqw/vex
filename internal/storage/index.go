@@ -25,6 +25,12 @@ type Index interface {
 	// Search finds the top-k most similar vectors to the query
 	Search(query []float32, k int) ([]vector.SearchResult, error)
 
+	// SearchWhere is Search restricted to keys for which allow returns true.
+	// A nil allow behaves like Search. Implementations may only consider
+	// candidates their search visits, so a restrictive predicate can return
+	// fewer than k results even when more keys match.
+	SearchWhere(query []float32, k int, allow func(key string) bool) ([]vector.SearchResult, error)
+
 	// Get returns the stored vector for key.
 	Get(key string) ([]float32, bool)
 

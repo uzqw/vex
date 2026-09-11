@@ -38,7 +38,8 @@ const (
 type shard struct {
 	mu   sync.RWMutex
 	data map[string][]float32
-	_    [CacheLineSize - 32]byte // Padding: RWMutex(24) + map(8) = 32 bytes, pad to 64
+	meta map[string]map[string]string // per-key scalar metadata, nil when unused
+	_    [CacheLineSize - 40]byte     // Padding: RWMutex(24) + maps(16) = 40 bytes, pad to 64
 }
 
 // Storage is a sharded, thread-safe in-memory vector storage
@@ -98,6 +99,52 @@ func (s *Storage) Set(key string, values []float32) error {
 	return nil
 }
 
+// SetMetadata replaces the scalar metadata for an existing key.
+// A nil or empty meta clears any stored metadata.
+func (s *Storage) SetMetadata(key string, meta map[string]string) error {
+	shard := s.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if _, ok := shard.data[key]; !ok {
+		return fmt.Errorf("key not found: %s", key)
+	}
+	if len(meta) == 0 {
+		if shard.meta != nil {
+			delete(shard.meta, key)
+		}
+		return nil
+	}
+	if shard.meta == nil {
+		shard.meta = make(map[string]map[string]string)
+	}
+	shard.meta[key] = meta
+	return nil
+}
+
+// GetMetadata returns the scalar metadata for key (nil when none).
+func (s *Storage) GetMetadata(key string) (map[string]string, bool) {
+	shard := s.getShard(key)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+	if _, ok := shard.data[key]; !ok {
+		return nil, false
+	}
+	return shard.meta[key], true
+}
+
+// Match reports whether key exists and its metadata has field == value.
+func (s *Storage) Match(key, field, value string) bool {
+	shard := s.getShard(key)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+	m, ok := shard.meta[key]
+	if !ok {
+		return false
+	}
+	v, ok := m[field]
+	return ok && v == value
+}
+
 // Get retrieves a vector by key
 func (s *Storage) Get(key string) ([]float32, bool) {
 	shard := s.getShard(key)
@@ -128,6 +175,9 @@ func (s *Storage) Delete(key string) bool {
 	_, exists := shard.data[key]
 	if exists {
 		delete(shard.data, key)
+		if shard.meta != nil {
+			delete(shard.meta, key)
+		}
 	}
 	return exists
 }
@@ -234,6 +284,7 @@ func (s *Storage) Clear() {
 		shard := s.shards[i]
 		shard.mu.Lock()
 		shard.data = make(map[string][]float32)
+		shard.meta = nil
 		shard.mu.Unlock()
 	}
 	s.dim.Store(0)
@@ -277,6 +328,31 @@ func (s *Storage) Snapshot() map[string][]float32 {
 		for key, vec := range s.shards[i].data {
 			copied := make([]float32, len(vec))
 			copy(copied, vec)
+			out[key] = copied
+		}
+	}
+	return out
+}
+
+// MetadataSnapshot returns a consistent copy of all key->metadata pairs.
+// Keys without metadata are omitted. Locking matches Snapshot.
+func (s *Storage) MetadataSnapshot() map[string]map[string]string {
+	for i := 0; i < ShardCount; i++ {
+		s.shards[i].mu.RLock()
+	}
+	defer func() {
+		for i := ShardCount - 1; i >= 0; i-- {
+			s.shards[i].mu.RUnlock()
+		}
+	}()
+
+	out := make(map[string]map[string]string)
+	for i := 0; i < ShardCount; i++ {
+		for key, meta := range s.shards[i].meta {
+			copied := make(map[string]string, len(meta))
+			for f, v := range meta {
+				copied[f] = v
+			}
 			out[key] = copied
 		}
 	}
