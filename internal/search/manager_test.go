@@ -650,3 +650,74 @@ func TestHNSWDropsStorageCopy(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+func TestGetAllVectorsResolvesDroppedBodies(t *testing.T) {
+	store := storage.New()
+	m, err := NewManager(store, Config{
+		Mode:               ModeHNSW,
+		NewIndex:           hnswFactory(),
+		RebuildDeleteRatio: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSet(t, m, "a", unit(3, 0, 0))
+	mustSet(t, m, "b", unit(0, 4, 0))
+
+	// HNSW mode drops store bodies; a naive store read would snapshot nils.
+	if body, _ := store.Get("a"); body != nil {
+		t.Fatal("expected dropped store body")
+	}
+
+	vecs, err := m.GetAllVectors()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vecs) != 2 {
+		t.Fatalf("got %d vectors, want 2", len(vecs))
+	}
+	if len(vecs["a"]) != 3 || vecs["a"][0] < 0.99 {
+		t.Fatalf("a = %v, want ~[1 0 0]", vecs["a"])
+	}
+	if len(vecs["b"]) != 3 || vecs["b"][1] < 0.99 {
+		t.Fatalf("b = %v, want ~[0 1 0]", vecs["b"])
+	}
+
+	// Snapshot copies must not alias index internals.
+	vecs["a"][0] = 42
+	got, _ := m.Get("a")
+	if got[0] == 42 {
+		t.Fatal("GetAllVectors aliased internal vector")
+	}
+}
+
+func TestSetAllVectorsRestoresAndIndexes(t *testing.T) {
+	m, err := NewManager(storage.New(), Config{
+		Mode:               ModeHNSW,
+		NewIndex:           hnswFactory(),
+		RebuildDeleteRatio: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = m.SetAllVectors(map[string][]float32{
+		"a": unit(1, 0, 0),
+		"b": unit(0, 1, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Count() != 2 {
+		t.Fatalf("count = %d, want 2", m.Count())
+	}
+	res, err := m.Search(unit(0, 1, 0), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || res[0].Key != "b" {
+		t.Fatalf("search = %v, want b", res)
+	}
+	if err := m.SetAllVectors(map[string][]float32{"bad": unit(1, 2)}); err == nil {
+		t.Fatal("expected dimension error for mismatched vector")
+	}
+}

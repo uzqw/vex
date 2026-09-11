@@ -35,6 +35,7 @@ import (
 	"github.com/uzqw/vex/internal/protocol"
 	"github.com/uzqw/vex/internal/search"
 	"github.com/uzqw/vex/internal/storage"
+	"github.com/uzqw/vex/internal/storage/persistence"
 	"github.com/uzqw/vex/pkg/logger"
 )
 
@@ -54,9 +55,13 @@ var (
 	hnswEf    = flag.Int("hnsw-ef", storage.DefaultHNSWEf, "HNSW search beam width")
 	hnswEfC   = flag.Int("hnsw-ef-construction", storage.DefaultHNSWEfConstruct, "HNSW construction beam width")
 	hnswSeed  = flag.Int64("hnsw-seed", 0, "HNSW RNG seed (0 uses random seed)")
+	persist   = flag.Bool("persist", false, "Enable snapshot persistence (load on start, snapshot on interval and shutdown)")
+	dataDir   = flag.String("data-dir", "./data", "Directory for persistence snapshots")
+	snapSecs  = flag.Int("snapshot-secs", 300, "Seconds between automatic snapshots (0 disables scheduled snapshots)")
 	showVer   = flag.Bool("version", false, "Show version and exit")
 	store     *storage.Storage
 	mgr       *search.Manager
+	persMgr   *persistence.Manager
 	log       *logger.Logger
 
 	// Version is set at build time via ldflags
@@ -152,6 +157,21 @@ func init() {
 		fmt.Fprintf(os.Stderr, "failed to create search manager: %v\n", err)
 		os.Exit(2)
 	}
+
+	// Persistence: snapshots read through mgr so HNSW/Auto index-held bodies
+	// are captured (store.Get returns nil bodies for packed vectors).
+	if *persist {
+		pCfg := persistence.DefaultConfig()
+		pCfg.Enabled = true
+		pCfg.DataDir = *dataDir
+		pCfg.SnapshotSeconds = *snapSecs
+		snapshotter := persistence.NewVectorSnapshot(pCfg, mgr)
+		persMgr, err = persistence.NewManager(pCfg, snapshotter)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create persistence manager: %v\n", err)
+			os.Exit(2)
+		}
+	}
 }
 
 func main() {
@@ -171,6 +191,13 @@ func main() {
 	// Setup graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Load latest snapshot and start the snapshot scheduler
+	if persMgr != nil {
+		if err := persMgr.Start(ctx); err != nil {
+			log.Error("failed to load snapshot, starting empty", slog.String("error", err.Error()))
+		}
+	}
 
 	// Handle OS signals for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -193,6 +220,14 @@ func main() {
 			select {
 			case <-ctx.Done():
 				log.Info("shutting down server")
+				if persMgr != nil {
+					stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer stopCancel()
+					if err := persMgr.TriggerSnapshot(stopCtx); err != nil {
+						log.Error("final snapshot failed", slog.String("error", err.Error()))
+					}
+					_ = persMgr.Stop(stopCtx)
+				}
 				return
 			default:
 				log.Error("failed to accept connection", slog.String("error", err.Error()))

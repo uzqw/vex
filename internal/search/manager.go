@@ -274,6 +274,37 @@ func (m *Manager) Count() int {
 	return m.store.Count()
 }
 
+// GetDimension returns the expected vector dimension (0 if unset).
+// Named for persistence.VectorDataSource.
+func (m *Manager) GetDimension() int {
+	return m.store.Dimension()
+}
+
+// GetAllKeys returns all keys currently in storage.
+func (m *Manager) GetAllKeys() []string {
+	return m.store.GetAllKeys()
+}
+
+// GetAllVectors returns copies of every vector, resolving bodies that
+// HNSW/Auto modes keep only in the packed index. Persistence snapshots must
+// go through this rather than reading Storage directly.
+func (m *Manager) GetAllVectors() (map[string][]float32, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.snapshotLocked(), nil
+}
+
+// SetAllVectors bulk-restores vectors through Set so storage and the
+// secondary index stay consistent. Used by persistence recovery.
+func (m *Manager) SetAllVectors(vectors map[string][]float32) error {
+	for key, vec := range vectors {
+		if _, err := m.Set(key, vec); err != nil {
+			return fmt.Errorf("failed to set vector %s: %w", key, err)
+		}
+	}
+	return nil
+}
+
 // Get returns a vector. HNSW/Auto may keep the body in the packed index.
 func (m *Manager) Get(key string) ([]float32, bool) {
 	v, ok := m.store.Get(key)
