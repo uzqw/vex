@@ -1184,3 +1184,181 @@ func TestSnapshotVectorsMatchesGetAllVectors(t *testing.T) {
 		}
 	}
 }
+
+// TestSearchProceedsDuringIndexInsert verifies the write-path lock
+// narrowing: a single Set no longer holds the manager lock across the
+// secondary-index insert, so reads complete while an insert is blocked
+// mid-flight. The HNSW single-writer ceiling stays: a second writer
+// waits for the first.
+func TestSearchProceedsDuringIndexInsert(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	idx := &gatedIndex{
+		Index: storage.NewHNSWIndexWithConfig(storage.HNSWConfig{
+			M: 8, EfConstruct: 32, Ef: 32, Seed: 1,
+		}),
+		entered: entered,
+		release: release,
+	}
+	m, err := NewManager(storage.New(), Config{
+		Mode:    ModeHNSW,
+		NewIndex: func() storage.Index { return idx },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	setDone := make(chan error, 1)
+	go func() {
+		_, err := m.Set("k", unit(1, 0, 0))
+		setDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("insert did not start")
+	}
+
+	// Reads must complete while the insert is blocked inside Insert.
+	readDone := make(chan error, 3)
+	go func() {
+		_, err := m.Search(unit(1, 0, 0), 1)
+		readDone <- err
+	}()
+	go func() {
+		v, ok := m.Get("k")
+		switch {
+		case !ok:
+			readDone <- fmt.Errorf("Get lost the blocked key")
+		case v == nil:
+			readDone <- fmt.Errorf("Get returned no body for the blocked key")
+		default:
+			readDone <- nil
+		}
+	}()
+	go func() {
+		_, err := m.GetAllVectors()
+		readDone <- err
+	}()
+	for i := 0; i < 3; i++ {
+		select {
+		case err := <-readDone:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("read stalled while an index insert was in progress")
+		}
+	}
+
+	// Single-writer ceiling: a second writer must wait for the blocked one.
+	writerDone := make(chan error, 1)
+	go func() {
+		_, err := m.Set("k2", unit(0, 1, 0))
+		writerDone <- err
+	}()
+	select {
+	case err := <-writerDone:
+		t.Fatalf("second writer completed during an in-flight insert: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-setDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-writerDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second writer never completed after the first insert")
+	}
+
+	// Both inserts landed and HNSW dropped the storage bodies.
+	for _, key := range []string{"k", "k2"} {
+		if body, ok := m.store.Get(key); !ok || body != nil {
+			t.Fatalf("key %q: storage body should be dropped, ok=%v body=%v", key, ok, body)
+		}
+	}
+	res, err := m.Search(unit(1, 0, 0), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || res[0].Key != "k" {
+		t.Fatalf("blocked-then-released key missing from index: %v", res)
+	}
+	res, err = m.Search(unit(0, 1, 0), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || res[0].Key != "k2" {
+		t.Fatalf("second key missing from index: %v", res)
+	}
+}
+
+// TestConcurrentWritesKeepIndexMatchingStore guards the writer ordering
+// writeMu provides: with many goroutines upserting shared keys and
+// deleting them, the secondary index must end up holding exactly the
+// store's value for every present key, and no deleted key may be
+// resurrected in the index by an in-flight insert. BruteForce mode
+// keeps storage bodies, so the store remains the observable truth.
+func TestConcurrentWritesKeepIndexMatchingStore(t *testing.T) {
+	m, err := NewManager(storage.New(), Config{
+		Mode:    ModeBruteForce,
+		NewIndex: func() storage.Index {
+			return storage.NewBruteForceIndex()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keys := []string{"a", "b", "c", "d"}
+	vals := [][]float32{unit(1, 0, 0), unit(0, 1, 0), unit(0, 0, 1)}
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				ki := (g + j) % len(keys)
+				if _, err := m.Set(keys[ki], vals[(g+j)%len(vals)]); err != nil {
+					t.Errorf("Set: %v", err)
+					return
+				}
+				if _, err := m.Search(unit(1, 1, 1), 4); err != nil {
+					t.Errorf("Search: %v", err)
+					return
+				}
+				if j%11 == 0 {
+					m.Delete(keys[(ki+1)%len(keys)])
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	storeCount := m.Count()
+	if idxCount := m.IndexCount(); idxCount != storeCount {
+		t.Fatalf("index holds %d keys, store holds %d", idxCount, storeCount)
+	}
+	for _, key := range keys {
+		storeVec, ok := m.store.Get(key)
+		if !ok {
+			// Deleted: must not linger in the index either.
+			if _, ok := m.index.Get(key); ok {
+				t.Fatalf("deleted key %q resurrected in index", key)
+			}
+			continue
+		}
+		idxVec, ok := m.index.Get(key)
+		if !ok {
+			t.Fatalf("key %q present in store but missing from index", key)
+		}
+		if !vecsEqual(storeVec, idxVec) {
+			t.Fatalf("key %q: index holds stale value %v, store holds %v", key, idxVec, storeVec)
+		}
+	}
+}

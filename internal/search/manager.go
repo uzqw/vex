@@ -121,6 +121,15 @@ type Manager struct {
 	// consistent view without ever holding the lock for the whole copy.
 	snapActive  bool
 	snapMutated map[string]struct{}
+
+	// writeMu serializes the full writer sequence — store write through
+	// secondary-index sync — so index mutations land in the same order as
+	// their store writes (a same-key upsert can never leave the index with
+	// the previous value) and Delete cannot interleave with an in-flight
+	// Set's index insert. Writers therefore serialize on the HNSW
+	// single-writer ceiling, but the manager lock is free for readers
+	// while an insert runs. Always acquire writeMu before mu.
+	writeMu sync.Mutex
 }
 
 // NewManager creates a Manager. Storage is always the source of truth.
@@ -186,14 +195,23 @@ func NewManager(store *storage.Storage, cfg Config) (*Manager, error) {
 	return m, nil
 }
 
-// Set upserts a vector. Storage is written first; index failures mark dirty
-// and do not roll back storage. created is true when the key did not exist.
+// Set upserts a vector. Storage is written first under a brief manager
+// lock, then the expensive secondary-index insert runs WITHOUT the
+// manager lock (writeMu keeps writer order stable) and a second brief
+// lock pass drops the storage body and services rebuild bookkeeping.
+// Index failures mark dirty and do not roll back storage. created is
+// true when the key did not exist.
 func (m *Manager) Set(key string, values []float32) (created bool, err error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
 
+	// Phase 1: commit to storage and log the mutation under the manager
+	// lock, then capture the index-sync decision and release so readers
+	// never wait on the insert that follows.
+	m.mu.Lock()
 	_, existed := m.store.Get(key)
 	if err := m.store.Set(key, values); err != nil {
+		m.mu.Unlock()
 		return false, err
 	}
 	if m.snapActive {
@@ -205,16 +223,51 @@ func (m *Manager) Set(key string, values []float32) (created bool, err error) {
 	}
 	normalized, ok := m.store.Get(key)
 	if !ok {
+		m.mu.Unlock()
 		return false, fmt.Errorf("failed to read normalized vector after set")
 	}
-
 	if existed {
 		m.mutationSinceBuild++
 	}
+	idx, doInsert := m.setSyncPlanLocked()
+	m.mu.Unlock()
 
-	if err := m.syncAfterSetLocked(key, normalized, existed); err != nil {
-		return !existed, err
+	if !doInsert {
+		return !existed, nil
 	}
+
+	// Phase 2: index work without the manager lock. idx stays safe to
+	// mutate because published indexes are only mutated by writeMu
+	// holders (Set, Delete); rebuild swaps only re-point m.index.
+	if existed {
+		if err := idx.Delete(key); err != nil {
+			m.mu.Lock()
+			if m.index == idx {
+				m.state = StateDirty
+			}
+			m.mu.Unlock()
+			return !existed, nil
+		}
+	}
+	insertErr := idx.Insert(key, normalized)
+
+	// Phase 3: publish bookkeeping under a brief lock. If idx was replaced
+	// while the insert ran (rebuild swap, auto-shrink drop, Clear), the
+	// fold/swap machinery already applied this mutation to the new index
+	// and this pass must not touch state or bodies.
+	m.mu.Lock()
+	if m.index == idx {
+		if insertErr != nil {
+			m.state = StateDirty
+		} else {
+			if m.mode == ModeHNSW || m.mode == ModeAuto {
+				// The published index now holds the body; drop the storage copy.
+				m.store.DropVector(key)
+			}
+			m.maybeRebuildLocked()
+		}
+	}
+	m.mu.Unlock()
 	return !existed, nil
 }
 
@@ -240,8 +293,13 @@ func (m *Manager) GetAllMetadata() (map[string]map[string]string, error) {
 	return m.store.MetadataSnapshot(), nil
 }
 
-// Delete removes a key from storage and the secondary index.
+// Delete removes a key from storage and the secondary index. It holds
+// writeMu so its store+index delete cannot interleave with an in-flight
+// Set's index insert on the same key.
 func (m *Manager) Delete(key string) bool {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -591,59 +649,37 @@ func (m *Manager) Rebuild() error {
 	return m.runRebuild(run)
 }
 
-func (m *Manager) syncAfterSetLocked(key string, normalized []float32, existed bool) error {
+// setSyncPlanLocked captures, while the caller holds m.mu, what index
+// work Set must do on the returned index after releasing the manager
+// lock. doInsert is false when the mutation path already handled the
+// index (rebuild started, dormant auto, or no index mode); then no
+// per-key work remains.
+func (m *Manager) setSyncPlanLocked() (idx storage.Index, doInsert bool) {
 	switch m.mode {
 	case ModeNone:
-		return nil
+		return nil, false
 
 	case ModeBruteForce, ModeHNSW:
 		if m.state != StateReady || m.index == nil {
 			m.startRebuildLocked() // storage already committed
-			return nil
+			return nil, false
 		}
-		if existed {
-			if err := m.index.Delete(key); err != nil {
-				m.state = StateDirty
-				return nil
-			}
-		}
-		if err := m.index.Insert(key, normalized); err != nil {
-			m.state = StateDirty
-			return nil // storage already committed
-		}
-		if m.mode == ModeHNSW {
-			m.store.DropVector(key)
-		}
-		m.maybeRebuildLocked()
-		return nil
+		return m.index, true
 
 	case ModeAuto:
-		count := m.store.Count()
-		if count < m.autoMin {
+		if m.store.Count() < m.autoMin {
 			if m.index != nil {
 				m.dropIndexLocked()
 			}
-			return nil
+			return nil, false
 		}
 		if m.state != StateReady || m.index == nil {
 			m.startRebuildLocked() // storage already committed
-			return nil
+			return nil, false
 		}
-		if existed {
-			if err := m.index.Delete(key); err != nil {
-				m.state = StateDirty
-				return nil
-			}
-		}
-		if err := m.index.Insert(key, normalized); err != nil {
-			m.state = StateDirty
-			return nil
-		}
-		m.store.DropVector(key)
-		m.maybeRebuildLocked()
-		return nil
+		return m.index, true
 	}
-	return nil
+	return nil, false
 }
 
 func (m *Manager) maybeRebuildLocked() {
