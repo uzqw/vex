@@ -94,16 +94,13 @@ Binary format optimized for fast loading:
 8. Clean up old snapshots (keep last N)
 ```
 
-### Copy-on-Write Strategy
+### Streaming Snapshot Strategy
 ```go
-// Take snapshot of current state without blocking writes
-snapshot := &Snapshot{
-    vectors: s.copyVectors(),  // Read-locked copy
-    index:   s.index.snapshot(), // HNSW snapshot
-}
-
-// Serialize in background
-go snapshot.saveToDisk(path)
+// Stream vectors to disk without holding locks for the whole copy.
+// Mutations are logged while the stream runs; a brief write-locked end
+// barrier re-emits mutated keys and reports removed ones, so the snapshot
+// equals one consistent point in time with a bounded write stall.
+count, err := sds.SnapshotVectors(emit, deleted)
 ```
 
 ## Recovery

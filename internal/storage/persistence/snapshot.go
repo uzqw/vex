@@ -61,6 +61,24 @@ type VectorDataSource interface {
 	GetDimension() int
 }
 
+// StreamingDataSource is an optional VectorDataSource that can stream an
+// internally consistent snapshot without materializing the whole library
+// in memory. When the data source implements it, Save streams to disk
+// instead of copying everything up front, so the snapshot does not stall
+// writes or spike memory on large libraries.
+type StreamingDataSource interface {
+	VectorDataSource
+
+	// SnapshotVectors streams an internally consistent snapshot: fn is
+	// called for every vector; a key mutated while the stream runs may be
+	// emitted more than once, with later emissions superseding earlier
+	// ones. deleted is called for keys removed while the stream ran and
+	// supersedes any earlier emission of that key. The emitted state equals
+	// the library state at the end of the stream. vec is only valid for the
+	// duration of the call. Returns the number of distinct keys emitted.
+	SnapshotVectors(fn func(key string, vec []float32) error, deleted func(key string) error) (int, error)
+}
+
 // MetadataDataSource is an optional extension of VectorDataSource for
 // sources that also carry per-key scalar metadata. When the data source
 // implements it, snapshots persist metadata in a fields.json sidecar and
@@ -98,19 +116,30 @@ func (s *VectorSnapshot) Save(ctx context.Context) error {
 	}
 	defer os.RemoveAll(tempDir) // Clean up on error
 
-	// Get all vectors from data source
-	vectors, err := s.dataSource.GetAllVectors()
-	if err != nil {
-		return fmt.Errorf("failed to get vectors: %w", err)
-	}
-
-	slog.Info("Starting snapshot", "vector_count", len(vectors))
-
-	// Save vector data
+	// Save vector data. Streaming sources write without materializing
+	// the whole library; map-based sources keep the original path.
 	vectorsPath := filepath.Join(tempDir, vectorsFile)
-	checksum, size, err := s.saveVectors(vectorsPath, vectors)
-	if err != nil {
-		return fmt.Errorf("failed to save vectors: %w", err)
+	var count int
+	var checksum []byte
+	var size int64
+	var err error
+	if sds, ok := s.dataSource.(StreamingDataSource); ok {
+		slog.Info("Starting snapshot (streaming)")
+		count, checksum, size, err = s.saveVectorsStreaming(vectorsPath, sds)
+		if err != nil {
+			return fmt.Errorf("failed to save vectors: %w", err)
+		}
+	} else {
+		vectors, err := s.dataSource.GetAllVectors()
+		if err != nil {
+			return fmt.Errorf("failed to get vectors: %w", err)
+		}
+		slog.Info("Starting snapshot", "vector_count", len(vectors))
+		count = len(vectors)
+		checksum, size, err = s.saveVectors(vectorsPath, vectors)
+		if err != nil {
+			return fmt.Errorf("failed to save vectors: %w", err)
+		}
 	}
 
 	// Save metadata sidecar when the source carries it
@@ -135,7 +164,7 @@ func (s *VectorSnapshot) Save(ctx context.Context) error {
 	metadata := &SnapshotInfo{
 		Version:     fmt.Sprintf("v%d", formatVersion),
 		CreatedAt:   time.Now(),
-		VectorCount: len(vectors),
+		VectorCount: count,
 		Dimension:   s.dataSource.GetDimension(),
 		IndexType:   "memory", // Will be "hnsw" in phase 2
 		SizeBytes:   size,
@@ -166,7 +195,7 @@ func (s *VectorSnapshot) Save(ctx context.Context) error {
 
 	duration := time.Since(start)
 	slog.Info("Snapshot completed",
-		"vector_count", len(vectors),
+		"vector_count", count,
 		"size_bytes", size,
 		"duration", duration,
 		"compressed", metadata.Compressed,
@@ -264,6 +293,125 @@ func (s *VectorSnapshot) GetLastSnapshotInfo() (*SnapshotInfo, error) {
 		return nil, nil
 	}
 	return info, err
+}
+
+// saveVectorsStreaming writes vectors.rdb from a streaming data source
+// without materializing the whole library. Emissions go to a raw staging
+// file first; since a key mutated mid-stream is re-emitted and a removed
+// key cannot be retracted from an append-only file, the final file is
+// then written by filtering the staging entries through the corrections
+// (re-emitted keys) and deletions recorded during the stream. The result
+// holds each key exactly once and equals the library state at the
+// snapshot's end barrier, in the same on-disk format as saveVectors.
+func (s *VectorSnapshot) saveVectorsStreaming(path string, sds StreamingDataSource) (int, []byte, int64, error) {
+	dim := sds.GetDimension()
+
+	stagePath := path + ".stage"
+	stage, err := os.Create(stagePath)
+	if err != nil {
+		return 0, nil, 0, err
+	}
+	defer os.Remove(stagePath)
+
+	// Staging header carries the dimension captured before the stream so
+	// the filter pass can parse entries even if the live dimension changed
+	// (e.g. CLEAR) after they were written.
+	if err := binary.Write(stage, binary.LittleEndian, uint32(dim)); err != nil {
+		stage.Close()
+		return 0, nil, 0, err
+	}
+
+	seen := make(map[string]struct{})
+	corrected := make(map[string][]float32)
+	dropped := make(map[string]struct{})
+	count, err := sds.SnapshotVectors(
+		func(key string, vec []float32) error {
+			if _, ok := seen[key]; ok {
+				// Re-emission: supersede the staged copy with this value.
+				v := make([]float32, len(vec))
+				copy(v, vec)
+				corrected[key] = v
+			}
+			seen[key] = struct{}{}
+			return s.writeVector(stage, key, vec)
+		},
+		func(key string) error {
+			dropped[key] = struct{}{}
+			return nil
+		},
+	)
+	if cerr := stage.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return 0, nil, 0, err
+	}
+	// CLEAR resets the dimension mid-snapshot; a mixed-dimension file
+	// would be unloadable, so abort and let the next snapshot retry.
+	if sds.GetDimension() != dim {
+		return 0, nil, 0, fmt.Errorf("vector dimension changed during snapshot")
+	}
+
+	stageFile, err := os.Open(stagePath)
+	if err != nil {
+		return 0, nil, 0, err
+	}
+	defer stageFile.Close()
+	stageReader := io.Reader(stageFile)
+	var stageDim uint32
+	if err := binary.Read(stageReader, binary.LittleEndian, &stageDim); err != nil {
+		return 0, nil, 0, err
+	}
+	dim = int(stageDim)
+
+	file, err := os.Create(path)
+	if err != nil {
+		return 0, nil, 0, err
+	}
+	defer file.Close()
+	hasher := sha256.New()
+	var writer io.Writer
+	if s.config.Compression == "snappy" {
+		writer = snappy.NewBufferedWriter(io.MultiWriter(file, hasher))
+	} else {
+		writer = io.MultiWriter(file, hasher)
+	}
+	if err := s.writeHeader(writer, count); err != nil {
+		return 0, nil, 0, err
+	}
+	for {
+		key, vec, err := s.readVector(stageReader, dim)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return 0, nil, 0, err
+		}
+		if _, ok := dropped[key]; ok {
+			continue
+		}
+		if _, ok := corrected[key]; ok {
+			continue
+		}
+		if err := s.writeVector(writer, key, vec); err != nil {
+			return 0, nil, 0, err
+		}
+	}
+	for key, vec := range corrected {
+		if err := s.writeVector(writer, key, vec); err != nil {
+			return 0, nil, 0, err
+		}
+	}
+	if sw, ok := writer.(*snappy.Writer); ok {
+		if err := sw.Close(); err != nil {
+			return 0, nil, 0, err
+		}
+	}
+	stat, err := file.Stat()
+	if err != nil {
+		return 0, nil, 0, err
+	}
+	return count, hasher.Sum(nil), stat.Size(), nil
 }
 
 // saveVectors writes vectors to disk in binary format

@@ -1000,3 +1000,187 @@ func TestMetadataSnapshotRoundTrip(t *testing.T) {
 		t.Fatalf("unexpected metadata on b: %v", got)
 	}
 }
+
+// axis returns a unit vector along axis i of the given dimension.
+func axis(dim, i int) []float32 {
+	v := make([]float32, dim)
+	v[i] = 1
+	return v
+}
+
+func vecsEqual(a, b []float32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		d := a[i] - b[i]
+		if d > 1e-6 || d < -1e-6 {
+			return false
+		}
+	}
+	return true
+}
+
+// TestSnapshotStreamsWhileWritesProceed is the leg-2 acceptance test: a
+// streaming snapshot must not block writes for the whole copy, and the
+// emitted state must be internally consistent — no torn pre/post mix.
+func TestSnapshotStreamsWhileWritesProceed(t *testing.T) {
+	m, err := NewManager(storage.New(), Config{
+		Mode:               ModeHNSW,
+		NewIndex:           hnswFactory(),
+		RebuildDeleteRatio: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 12
+	for i := 0; i < n; i++ {
+		mustSet(t, m, fmt.Sprintf("k%02d", i), axis(n, i))
+	}
+
+	entered := make(chan string, 1)
+	gate := make(chan struct{})
+	type snapResult struct {
+		count int
+		err   error
+	}
+	done := make(chan snapResult, 1)
+	assembled := make(map[string][]float32)
+	removed := make(map[string]bool)
+	go func() {
+		var gated bool
+		count, err := m.SnapshotVectors(
+			func(key string, vec []float32) error {
+				if !gated {
+					gated = true
+					entered <- key
+					<-gate
+				}
+				assembled[key] = append([]float32(nil), vec...)
+				return nil
+			},
+			func(key string) error {
+				removed[key] = true
+				return nil
+			},
+		)
+		done <- snapResult{count, err}
+	}()
+
+	// The snapshot is now blocked mid-stream inside fn. All three mutation
+	// kinds must complete while it stays blocked: the write stall is
+	// bounded to the short end barrier, never the full-library copy.
+	first := <-entered
+	delKey := "k00"
+	if first == delKey {
+		delKey = "k01"
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		if _, err := m.Set(first, axis(n, 11)); err != nil {
+			writeDone <- err
+			return
+		}
+		m.Delete(delKey)
+		_, err := m.Set("added", axis(n, 10))
+		writeDone <- err
+	}()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("writes stalled while the snapshot stream was blocked")
+	}
+
+	close(gate)
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatal(res.err)
+		}
+		if res.count != n {
+			t.Fatalf("snapshot count = %d, want %d", res.count, n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("snapshot did not finish after the stream was released")
+	}
+
+	// Deletions supersede earlier emissions.
+	for key := range removed {
+		delete(assembled, key)
+	}
+
+	expected := make(map[string][]float32)
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("k%02d", i)
+		switch {
+		case key == delKey:
+			// removed mid-snapshot
+		case key == first:
+			expected[key] = axis(n, 11)
+		default:
+			expected[key] = axis(n, i)
+		}
+	}
+	expected["added"] = axis(n, 10)
+
+	if len(assembled) != len(expected) {
+		t.Fatalf("snapshot has %d keys, want %d (removed=%v, extra=%v)",
+			len(assembled), len(expected), removed, assembled)
+	}
+	for key, want := range expected {
+		got, ok := assembled[key]
+		if !ok {
+			t.Fatalf("snapshot missing key %q", key)
+		}
+		if !vecsEqual(got, want) {
+			t.Fatalf("key %q: got %v, want %v", key, got, want)
+		}
+	}
+}
+
+func TestSnapshotVectorsMatchesGetAllVectors(t *testing.T) {
+	m, err := NewManager(storage.New(), Config{
+		Mode:               ModeHNSW,
+		NewIndex:           hnswFactory(),
+		RebuildDeleteRatio: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSet(t, m, "a", axis(3, 0))
+	mustSet(t, m, "b", axis(3, 1))
+	mustSet(t, m, "c", axis(3, 2))
+
+	// HNSW dropped the store bodies; the stream must resolve them through
+	// the published index.
+	if body, _ := m.store.Get("a"); body != nil {
+		t.Fatal("expected dropped store body")
+	}
+
+	assembled := make(map[string][]float32)
+	count, err := m.SnapshotVectors(
+		func(key string, vec []float32) error {
+			assembled[key] = append([]float32(nil), vec...)
+			return nil
+		},
+		func(key string) error { return nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := m.GetAllVectors()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != len(want) || len(assembled) != len(want) {
+		t.Fatalf("snapshot count=%d assembled=%d want=%d", count, len(assembled), len(want))
+	}
+	for key, w := range want {
+		if !vecsEqual(assembled[key], w) {
+			t.Fatalf("key %q: got %v want %v", key, assembled[key], w)
+		}
+	}
+}

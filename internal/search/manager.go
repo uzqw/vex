@@ -114,6 +114,13 @@ type Manager struct {
 	// them into the new index so it is consistent at publish time.
 	rebuilding     bool
 	rebuildPending map[string]struct{}
+
+	// snapActive is true while SnapshotVectors streams phase 1. Mutators
+	// then record every mutated key in snapMutated so the snapshot can
+	// re-read those keys at its end barrier and emit an internally
+	// consistent view without ever holding the lock for the whole copy.
+	snapActive  bool
+	snapMutated map[string]struct{}
 }
 
 // NewManager creates a Manager. Storage is always the source of truth.
@@ -189,6 +196,9 @@ func (m *Manager) Set(key string, values []float32) (created bool, err error) {
 	if err := m.store.Set(key, values); err != nil {
 		return false, err
 	}
+	if m.snapActive {
+		m.snapMutated[key] = struct{}{}
+	}
 	if m.rebuilding {
 		// Fold this mutation into the in-flight rebuild at its swap.
 		m.rebuildPending[key] = struct{}{}
@@ -238,6 +248,9 @@ func (m *Manager) Delete(key string) bool {
 	deleted := m.store.Delete(key)
 	if !deleted {
 		return false
+	}
+	if m.snapActive {
+		m.snapMutated[key] = struct{}{}
 	}
 	if m.rebuilding {
 		m.rebuildPending[key] = struct{}{}
@@ -352,6 +365,13 @@ func (m *Manager) storeSearch(query []float32, k int, allow func(string) bool) (
 func (m *Manager) Clear() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.snapActive {
+		// Log every key so an in-flight snapshot's end barrier drops them
+		// all instead of resurrecting pre-Clear vectors.
+		for _, key := range m.store.GetAllKeys() {
+			m.snapMutated[key] = struct{}{}
+		}
+	}
 	m.rebuildGen++
 	m.store.Clear()
 	// Drop without Clear so in-flight Search on the old pointer can finish.
@@ -380,9 +400,90 @@ func (m *Manager) GetAllKeys() []string {
 	return m.store.GetAllKeys()
 }
 
+// SnapshotVectors streams an internally consistent snapshot of every
+// vector without materializing the whole library or holding the manager
+// lock for the copy. fn(key, vec) is called for every vector; a key mutated
+// while the stream runs may be emitted more than once, with later
+// emissions superseding earlier ones. deleted(key) is called for keys
+// removed while the stream ran and supersedes any earlier emission of
+// that key. The emitted state equals the library state at the snapshot's
+// end barrier: phase 1 streams the start key set without the manager
+// lock, mutations are logged meanwhile, and a brief write-locked barrier
+// re-reads only the mutated keys. Writes therefore stall only for that
+// bounded pass, never for the full-library copy. vec is only valid for
+// the duration of the call. Returns the number of distinct keys emitted.
+func (m *Manager) SnapshotVectors(fn func(key string, vec []float32) error, deleted func(key string) error) (int, error) {
+	m.mu.Lock()
+	if m.snapActive {
+		m.mu.Unlock()
+		return 0, fmt.Errorf("snapshot already in progress")
+	}
+	m.snapActive = true
+	m.snapMutated = make(map[string]struct{})
+	keys := m.store.GetAllKeys()
+	m.mu.Unlock()
+
+	for _, key := range keys {
+		vec, ok := m.vecForLive(key)
+		if !ok {
+			continue
+		}
+		if err := fn(key, vec); err != nil {
+			m.endSnapshot()
+			return 0, err
+		}
+	}
+
+	// End barrier: stop mutation logging and re-read every mutated key
+	// under one brief write lock, so the emitted state equals the store
+	// at this point. Corrections are copied and delivered after releasing
+	// the lock so disk I/O in fn never blocks writers.
+	m.mu.Lock()
+	m.snapActive = false
+	mutated := m.snapMutated
+	m.snapMutated = nil
+	count := m.store.Count()
+	type correction struct {
+		key string
+		vec []float32
+	}
+	corrections := make([]correction, 0, len(mutated))
+	var removed []string
+	for key := range mutated {
+		if vec, ok := m.vecFor(key, m.index); ok {
+			copied := make([]float32, len(vec))
+			copy(copied, vec)
+			corrections = append(corrections, correction{key, copied})
+		} else {
+			removed = append(removed, key)
+		}
+	}
+	m.mu.Unlock()
+
+	for _, c := range corrections {
+		if err := fn(c.key, c.vec); err != nil {
+			return 0, err
+		}
+	}
+	for _, key := range removed {
+		if err := deleted(key); err != nil {
+			return 0, err
+		}
+	}
+	return count, nil
+}
+
+// endSnapshot aborts an in-flight streaming snapshot barrier.
+func (m *Manager) endSnapshot() {
+	m.mu.Lock()
+	m.snapActive = false
+	m.snapMutated = nil
+	m.mu.Unlock()
+}
+
 // GetAllVectors returns copies of every vector, resolving bodies that
-// HNSW/Auto modes keep only in the packed index. Persistence snapshots must
-// go through this rather than reading Storage directly.
+// HNSW/Auto modes keep only in the packed index. Persistence snapshots
+// must go through this rather than reading Storage directly.
 func (m *Manager) GetAllVectors() (map[string][]float32, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -454,10 +555,11 @@ func (m *Manager) IndexCount() int {
 }
 
 // Rebuild rebuilds the secondary index from a consistent storage snapshot.
-// The new index is built without holding the manager lock — reads and
-// writes keep running on the old index — and is swapped in atomically.
-// Mutations issued while the build runs are folded in before the swap.
-// Returns an error if a rebuild is already in progress.
+// The key set is captured under a brief lock and the new index is built by
+// streaming vectors one by one without holding the manager lock — reads
+// and writes keep running on the old index — and the result is swapped in
+// atomically. Mutations issued while the build runs are folded in before
+// the swap. Returns an error if a rebuild is already in progress.
 func (m *Manager) Rebuild() error {
 	m.mu.Lock()
 	if m.mode == ModeNone {
@@ -482,7 +584,7 @@ func (m *Manager) Rebuild() error {
 	m.rebuildPending = make(map[string]struct{})
 	run := &rebuildRun{
 		gen:     m.rebuildGen,
-		snap:    m.snapshotLocked(),
+		keys:    m.sortedKeysLocked(),
 		pending: m.rebuildPending,
 	}
 	m.mu.Unlock()
@@ -584,15 +686,26 @@ type rebuildRun struct {
 	// gen is rebuildGen at start; a mismatch means the index was dropped
 	// or cleared during the build and the swap must be abandoned.
 	gen int
-	// snap is the consistent storage snapshot the new index is built from.
-	snap map[string][]float32
+	// keys is the sorted key set captured when the rebuild started. Bodies
+	// are streamed from the live store/index during the build instead of
+	// copying the whole library under the lock.
+	keys []string
 	// pending holds keys mutated while the build runs (guarded by m.mu).
 	pending map[string]struct{}
 }
 
-// startRebuildLocked snapshots storage under the already-held write lock and
-// launches the index build in the background, so reads and writes keep
-// running on the old index while the new one is built. Caller holds m.mu.
+// sortedKeysLocked returns all store keys in deterministic order so HNSW
+// construction is reproducible. Caller holds m.mu.
+func (m *Manager) sortedKeysLocked() []string {
+	keys := m.store.GetAllKeys()
+	sort.Strings(keys)
+	return keys
+}
+
+// startRebuildLocked captures the storage key set under the already-held
+// write lock and launches the index build in the background, so reads and
+// writes keep running on the old index while the new one is built. Caller
+// holds m.mu.
 func (m *Manager) startRebuildLocked() {
 	if m.mode == ModeNone || m.rebuilding {
 		return
@@ -609,28 +722,26 @@ func (m *Manager) startRebuildLocked() {
 	m.rebuildPending = make(map[string]struct{})
 	run := &rebuildRun{
 		gen:     m.rebuildGen,
-		snap:    m.snapshotLocked(),
+		keys:    m.sortedKeysLocked(),
 		pending: m.rebuildPending,
 	}
 	go func() { _ = m.runRebuild(run) }()
 }
 
-// runRebuild inserts the snapshot into a private index without holding the
-// manager lock, then briefly takes the write lock to fold mutations that
-// happened during the build into the new index and publish the swap.
-// The previous index is not Clear()'d so in-flight Search on the old pointer
-// remains valid. Called synchronously by Rebuild, in the background by
-// startRebuildLocked.
+// runRebuild streams the captured key set into a private index without
+// holding the manager lock, then briefly takes the write lock to fold
+// mutations that happened during the build into the new index and publish
+// the swap. The previous index is not Clear()'d so in-flight Search on the
+// old pointer remains valid. Called synchronously by Rebuild, in the
+// background by startRebuildLocked.
 func (m *Manager) runRebuild(run *rebuildRun) error {
-	keys := make([]string, 0, len(run.snap))
-	for k := range run.snap {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
 	newIdx := m.newIndex()
-	for _, key := range keys {
-		if err := newIdx.Insert(key, run.snap[key]); err != nil {
+	for _, key := range run.keys {
+		vec, ok := m.vecForLive(key)
+		if !ok {
+			continue // deleted while building; the swap fold drops it
+		}
+		if err := newIdx.Insert(key, vec); err != nil {
 			m.mu.Lock()
 			m.rebuildFailedLocked()
 			m.mu.Unlock()
@@ -665,7 +776,7 @@ func (m *Manager) runRebuild(run *rebuildRun) error {
 	m.rebuilding = false
 	m.rebuildPending = nil
 	if m.mode == ModeHNSW || m.mode == ModeAuto {
-		for _, key := range keys {
+		for _, key := range run.keys {
 			m.store.DropVector(key)
 		}
 		for key := range run.pending {

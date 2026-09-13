@@ -19,9 +19,14 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+
+	"github.com/uzqw/vex/internal/search"
+	"github.com/uzqw/vex/internal/storage"
 )
 
 // mockDataSource implements VectorDataSource for testing
@@ -891,5 +896,175 @@ func TestSnapshotLoadWithoutFieldsFile(t *testing.T) {
 	}
 	if len(dst.vectors) != 1 {
 		t.Fatalf("restored %d vectors, want 1", len(dst.vectors))
+	}
+}
+
+// scriptedStreamingSource replays a fixed emission script to exercise the
+// streaming Save receiver deterministically (re-emissions and deletions).
+type scriptedStreamingSource struct {
+	mockDataSource
+	script func(fn func(string, []float32) error, deleted func(string) error) (int, error)
+}
+
+func (s *scriptedStreamingSource) SnapshotVectors(fn func(string, []float32) error, deleted func(string) error) (int, error) {
+	return s.script(fn, deleted)
+}
+
+func TestSnapshotSaveLoadStreaming(t *testing.T) {
+	va := []float32{1, 0, 0}
+	vb1 := []float32{0, 1, 0}
+	vb2 := []float32{0, 0, 1}
+	vc := []float32{0.5, 0.5, 0}
+	vd := []float32{0, 1, 1}
+	src := &scriptedStreamingSource{
+		mockDataSource: mockDataSource{dimension: 3},
+		script: func(fn func(string, []float32) error, deleted func(string) error) (int, error) {
+			// Phase 1 emissions.
+			if err := fn("a", va); err != nil {
+				return 0, err
+			}
+			if err := fn("b", vb1); err != nil {
+				return 0, err
+			}
+			if err := fn("c", vc); err != nil {
+				return 0, err
+			}
+			// End-barrier corrections: b re-emitted, d added, c removed.
+			if err := fn("b", vb2); err != nil {
+				return 0, err
+			}
+			if err := fn("d", vd); err != nil {
+				return 0, err
+			}
+			if err := deleted("c"); err != nil {
+				return 0, err
+			}
+			return 3, nil
+		},
+	}
+
+	dir := t.TempDir()
+	cfg := Config{
+		Enabled:         true,
+		DataDir:         dir,
+		KeepSnapshots:   1,
+		Compression:     "snappy",
+		Checksum:        true,
+		SnapshotSeconds: 0,
+	}
+	if err := NewVectorSnapshot(cfg, src).Save(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := NewVectorSnapshot(cfg, src).GetLastSnapshotInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.VectorCount != 3 {
+		t.Fatalf("VectorCount = %d, want 3", info.VectorCount)
+	}
+
+	// The staging file must not ship into the finalized snapshot.
+	ents, err := os.ReadDir(filepath.Join(dir, "latest"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]int{}
+	for _, e := range ents {
+		names[e.Name()]++
+	}
+	if names[vectorsFile] != 1 || names[metadataFile] != 1 || len(names) != 2 {
+		t.Fatalf("latest contains unexpected files: %v", names)
+	}
+
+	// Load into a fresh source and verify the end-barrier state: the stale
+	// b and removed c from phase 1 must not survive.
+	dst := &mockDataSource{}
+	if err := NewVectorSnapshot(cfg, dst).Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]float32{"a": va, "b": vb2, "d": vd}
+	if !reflect.DeepEqual(dst.vectors, want) {
+		t.Fatalf("loaded %v, want %v", dst.vectors, want)
+	}
+}
+
+func TestSnapshotSaveLoadRealManagerStreaming(t *testing.T) {
+	factory := func() storage.Index {
+		return storage.NewHNSWIndexWithConfig(storage.HNSWConfig{
+			M: 8, EfConstruct: 32, Ef: 32, Seed: 7,
+		})
+	}
+	mgr, err := search.NewManager(storage.New(), search.Config{
+		Mode:     search.ModeHNSW,
+		NewIndex: factory,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Compile-time guarantee that the real manager takes the streaming
+	// Save path.
+	var _ StreamingDataSource = mgr
+
+	for i := 0; i < 100; i++ {
+		v := make([]float32, 4)
+		v[i%4] = float32(i + 1)
+		if _, err := mgr.Set(fmt.Sprintf("key%03d", i), v); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := Config{
+		Enabled:         true,
+		DataDir:         t.TempDir(),
+		KeepSnapshots:   1,
+		Compression:     "snappy",
+		Checksum:        true,
+		SnapshotSeconds: 0,
+	}
+	if err := NewVectorSnapshot(cfg, mgr).Save(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := NewVectorSnapshot(cfg, mgr).GetLastSnapshotInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.VectorCount != 100 {
+		t.Fatalf("VectorCount = %d, want 100", info.VectorCount)
+	}
+
+	mgr2, err := search.NewManager(storage.New(), search.Config{
+		Mode:     search.ModeHNSW,
+		NewIndex: factory,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := NewVectorSnapshot(cfg, mgr2).Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want, err := mgr.GetAllVectors()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := mgr2.GetAllVectors()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("restored %d vectors, want %d", len(got), len(want))
+	}
+	for key, w := range want {
+		g, ok := got[key]
+		if !ok || len(g) != len(w) {
+			t.Fatalf("key %q: got %v, want %v", key, g, w)
+		}
+		for i := range g {
+			d := g[i] - w[i]
+			if d > 1e-6 || d < -1e-6 {
+				t.Fatalf("key %q: got %v, want %v", key, g, w)
+			}
+		}
 	}
 }
