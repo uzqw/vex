@@ -78,6 +78,36 @@ func TestAutoBelowThresholdSearchSeesAll(t *testing.T) {
 	}
 }
 
+// gatedIndex signals on its first Insert and blocks every Insert until
+// release is closed, holding a rebuild deterministically in progress.
+type gatedIndex struct {
+	storage.Index
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (g *gatedIndex) Insert(key string, vec []float32) error {
+	g.once.Do(func() { close(g.entered) })
+	<-g.release
+	return g.Index.Insert(key, vec)
+}
+
+// waitEventually polls cond until it holds or the timeout passes.
+// Rebuilds triggered by mutations run in the background, so tests that
+// need the rebuilt index poll instead of assuming synchronous completion.
+func waitEventually(t *testing.T, timeout time.Duration, msg string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", msg)
+}
+
 func TestAutoCrossThresholdBackfill(t *testing.T) {
 	m := newAutoManager(t, 4)
 	for i := 0; i < 3; i++ {
@@ -87,12 +117,9 @@ func TestAutoCrossThresholdBackfill(t *testing.T) {
 		t.Fatalf("want dormant before threshold")
 	}
 	mustSet(t, m, "k3", unit(4, 1, 0))
-	if m.State() != StateReady {
-		t.Fatalf("state = %v, want ready", m.State())
-	}
-	if got := m.IndexCount(); got != 4 {
-		t.Fatalf("index count = %d, want 4", got)
-	}
+	waitEventually(t, 5*time.Second, "index ready after threshold crossing", func() bool {
+		return m.State() == StateReady && m.IndexCount() == 4
+	})
 	res, err := m.Search(unit(1, 1, 0), 4)
 	if err != nil {
 		t.Fatal(err)
@@ -116,9 +143,9 @@ func TestAutoUpsertAroundThreshold(t *testing.T) {
 	mustSet(t, m, "a", unit(1, 0, 0))
 	mustSet(t, m, "b", unit(0, 1, 0))
 	mustSet(t, m, "c", unit(0, 0, 1))
-	if m.IndexCount() != 3 {
-		t.Fatalf("index count = %d", m.IndexCount())
-	}
+	waitEventually(t, 5*time.Second, "index ready after threshold crossing", func() bool {
+		return m.State() == StateReady && m.IndexCount() == 3
+	})
 	mustSet(t, m, "a", unit(1, 1, 0))
 	if m.IndexCount() != 3 {
 		t.Fatalf("after upsert index count = %d", m.IndexCount())
@@ -137,9 +164,9 @@ func TestAutoDeleteBelowThresholdDropsIndex(t *testing.T) {
 	mustSet(t, m, "a", unit(1, 0, 0))
 	mustSet(t, m, "b", unit(0, 1, 0))
 	mustSet(t, m, "c", unit(0, 0, 1))
-	if m.State() != StateReady {
-		t.Fatal("want ready")
-	}
+	waitEventually(t, 5*time.Second, "index ready after threshold crossing", func() bool {
+		return m.State() == StateReady
+	})
 	if !m.Delete("c") {
 		t.Fatal("delete failed")
 	}
@@ -410,6 +437,117 @@ func TestRebuildDoesNotClearIndexUsedByInflightSearch(t *testing.T) {
 	}
 }
 
+// TestSearchAndWriteProgressDuringRebuild is the acceptance check for the
+// rebuild lock-scope fix: a churn-triggered rebuild builds its new index
+// outside the manager write lock, so searches and writes keep completing
+// while the rebuild is in progress, and mutations issued during the build
+// are folded into the new index before it is published.
+func TestSearchAndWriteProgressDuringRebuild(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var builds atomic.Int32
+
+	m, err := NewManager(storage.New(), Config{
+		Mode: ModeHNSW,
+		NewIndex: func() storage.Index {
+			n := builds.Add(1)
+			base := storage.NewHNSWIndexWithConfig(storage.HNSWConfig{
+				M: 8, EfConstruct: 32, Ef: 32, Seed: 1,
+			})
+			if n == 2 {
+				return &gatedIndex{Index: base, entered: entered, release: release}
+			}
+			return base
+		},
+		RebuildDeleteRatio: 0.1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 50 vectors on the x-axis.
+	for i := 0; i < 50; i++ {
+		mustSet(t, m, fmt.Sprintf("k%02d", i), unit(float32(i+1), 0, 0))
+	}
+	// Upsert churn: 6 upserts >= 0.1*50 triggers a rebuild on the last one.
+	for i := 0; i < 6; i++ {
+		mustSet(t, m, fmt.Sprintf("k%02d", i), unit(0, 1, 0))
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rebuild did not start")
+	}
+
+	// The rebuild is now blocked mid-build. Searches and writes must still
+	// complete instead of stalling for the whole rebuild.
+	type opResult struct {
+		err error
+	}
+	done := make(chan opResult, 2)
+	go func() {
+		res, err := m.Search(unit(0, 1, 0), 6)
+		if err == nil {
+			got := map[string]bool{}
+			for _, r := range res {
+				got[r.Key] = true
+			}
+			for i := 0; i < 6; i++ {
+				if !got[fmt.Sprintf("k%02d", i)] {
+					err = fmt.Errorf("search missed upserted key k%02d: %v", i, res)
+					break
+				}
+			}
+		}
+		done <- opResult{err}
+	}()
+	go func() {
+		_, err := m.Set("during", unit(0, 0, 1))
+		done <- opResult{err}
+	}()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-done:
+			if r.err != nil {
+				t.Fatal(r.err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("search/write stalled while rebuild in progress")
+		}
+	}
+
+	// Let the rebuild finish and publish, then verify the mutation issued
+	// during the build is visible through the new index.
+	close(release)
+	waitEventually(t, 5*time.Second, "rebuilt index with 51 entries", func() bool {
+		return m.State() == StateReady && m.IndexCount() == 51
+	})
+
+	res, err := m.Search(unit(0, 0, 1), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || res[0].Key != "during" {
+		t.Fatalf("key set during rebuild missing from new index: %v", res)
+	}
+
+	res, err = m.Search(unit(0, 1, 0), 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, r := range res {
+		got[r.Key] = true
+	}
+	for i := 0; i < 6; i++ {
+		if !got[fmt.Sprintf("k%02d", i)] {
+			t.Fatalf("upserted key k%02d missing after rebuild: %v", i, res)
+		}
+	}
+}
+
 func TestNewManagerBackfillsPrepopulatedStore(t *testing.T) {
 	store := storage.New()
 	_ = store.Set("a", unit(1, 0, 0))
@@ -505,12 +643,9 @@ func TestConcurrentCrossThreshold(t *testing.T) {
 	if m.Count() != 100 {
 		t.Fatalf("count = %d", m.Count())
 	}
-	if m.State() != StateReady {
-		t.Fatalf("state = %v", m.State())
-	}
-	if m.IndexCount() != 100 {
-		t.Fatalf("index count = %d, want 100", m.IndexCount())
-	}
+	waitEventually(t, 10*time.Second, "index ready with all keys", func() bool {
+		return m.State() == StateReady && m.IndexCount() == 100
+	})
 	res, err := m.Search(unit(1, 1, 1), 10)
 	if err != nil {
 		t.Fatal(err)

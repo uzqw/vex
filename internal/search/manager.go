@@ -103,6 +103,17 @@ type Manager struct {
 	newIndex           func() storage.Index
 	rebuildDeleteRatio float64 // <=0 disables periodic rebuild
 	mutationSinceBuild int     // deletes + upserts since last successful build/swap
+
+	// rebuildGen increments whenever the published index is dropped or
+	// cleared (dropIndexLocked, Clear); an in-flight rebuild whose captured
+	// gen no longer matches abandons its swap instead of publishing a
+	// stale index.
+	rebuildGen int
+	// rebuilding is true while a background rebuild builds a private index.
+	// rebuildPending collects keys mutated during that build; the swap folds
+	// them into the new index so it is consistent at publish time.
+	rebuilding     bool
+	rebuildPending map[string]struct{}
 }
 
 // NewManager creates a Manager. Storage is always the source of truth.
@@ -143,7 +154,7 @@ func NewManager(store *storage.Storage, cfg Config) (*Manager, error) {
 			return nil, fmt.Errorf("NewIndex is required for mode %v", cfg.Mode)
 		}
 		if store.Count() > 0 {
-			if err := m.rebuildFromStoreLocked(); err != nil {
+			if err := m.Rebuild(); err != nil {
 				return nil, fmt.Errorf("initial rebuild: %w", err)
 			}
 		} else {
@@ -155,7 +166,7 @@ func NewManager(store *storage.Storage, cfg Config) (*Manager, error) {
 			return nil, fmt.Errorf("NewIndex is required for auto mode")
 		}
 		if store.Count() >= m.autoMin {
-			if err := m.rebuildFromStoreLocked(); err != nil {
+			if err := m.Rebuild(); err != nil {
 				return nil, fmt.Errorf("initial rebuild: %w", err)
 			}
 		} else {
@@ -177,6 +188,10 @@ func (m *Manager) Set(key string, values []float32) (created bool, err error) {
 	_, existed := m.store.Get(key)
 	if err := m.store.Set(key, values); err != nil {
 		return false, err
+	}
+	if m.rebuilding {
+		// Fold this mutation into the in-flight rebuild at its swap.
+		m.rebuildPending[key] = struct{}{}
 	}
 	normalized, ok := m.store.Get(key)
 	if !ok {
@@ -224,6 +239,9 @@ func (m *Manager) Delete(key string) bool {
 	if !deleted {
 		return false
 	}
+	if m.rebuilding {
+		m.rebuildPending[key] = struct{}{}
+	}
 	m.mutationSinceBuild++
 
 	if m.index != nil && m.state == StateReady {
@@ -263,7 +281,7 @@ func (m *Manager) SearchFiltered(query []float32, k int, field, value string) ([
 
 	if !useIndex {
 		if m.mode == ModeHNSW || (m.mode == ModeAuto && idx != nil) {
-			return m.searchResolved(query, k, idx, allow)
+			return m.searchResolved(query, k, allow)
 		}
 		return m.storeSearch(query, k, allow)
 	}
@@ -274,7 +292,7 @@ func (m *Manager) SearchFiltered(query []float32, k int, field, value string) ([
 	}
 	results, err := idx.SearchWhere(normalized, k, allow)
 	if err != nil {
-		fallback, ferr := m.fallbackSearch(query, k, idx, allow)
+		fallback, ferr := m.fallbackSearch(query, k, allow)
 		if ferr != nil {
 			// Query/storage error, not an index fault.
 			return nil, err
@@ -292,7 +310,10 @@ func (m *Manager) SearchFiltered(query []float32, k int, field, value string) ([
 
 // storeSearch is Storage.Search with an optional key predicate.
 func (m *Manager) storeSearch(query []float32, k int, allow func(string) bool) ([]vector.SearchResult, error) {
-	if allow == nil {
+	if allow == nil && (m.mode == ModeNone || m.mode == ModeBruteForce) {
+		// These modes never drop storage bodies into the index, so the raw
+		// storage scan is safe. HNSW/Auto must resolve through vecForLive:
+		// a rebuild swap may drop bodies while this scan runs.
 		return m.store.Search(query, k)
 	}
 	normalizedQuery, err := vector.Normalize(query)
@@ -302,11 +323,11 @@ func (m *Manager) storeSearch(query []float32, k int, allow func(string) bool) (
 	h := &vector.TopKHeap{}
 	heap.Init(h)
 	for _, key := range m.store.GetAllKeys() {
-		if !allow(key) {
+		if allow != nil && !allow(key) {
 			continue
 		}
-		vec, ok := m.store.Get(key)
-		if !ok || vec == nil {
+		vec, ok := m.vecForLive(key)
+		if !ok {
 			continue
 		}
 		similarity, err := vector.DotProduct(normalizedQuery, vec)
@@ -331,6 +352,7 @@ func (m *Manager) storeSearch(query []float32, k int, allow func(string) bool) (
 func (m *Manager) Clear() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.rebuildGen++
 	m.store.Clear()
 	// Drop without Clear so in-flight Search on the old pointer can finish.
 	m.index = nil
@@ -431,11 +453,40 @@ func (m *Manager) IndexCount() int {
 	return m.index.Count()
 }
 
-// Rebuild rebuilds the secondary index from a storage snapshot (if mode uses one).
+// Rebuild rebuilds the secondary index from a consistent storage snapshot.
+// The new index is built without holding the manager lock — reads and
+// writes keep running on the old index — and is swapped in atomically.
+// Mutations issued while the build runs are folded in before the swap.
+// Returns an error if a rebuild is already in progress.
 func (m *Manager) Rebuild() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.rebuildFromStoreLocked()
+	if m.mode == ModeNone {
+		m.mu.Unlock()
+		return nil
+	}
+	if m.rebuilding {
+		m.mu.Unlock()
+		return fmt.Errorf("rebuild already in progress")
+	}
+	if m.mode == ModeAuto && m.store.Count() < m.autoMin {
+		m.dropIndexLocked()
+		m.mu.Unlock()
+		return nil
+	}
+	if m.newIndex == nil {
+		m.state = StateDirty
+		m.mu.Unlock()
+		return fmt.Errorf("no index factory configured")
+	}
+	m.rebuilding = true
+	m.rebuildPending = make(map[string]struct{})
+	run := &rebuildRun{
+		gen:     m.rebuildGen,
+		snap:    m.snapshotLocked(),
+		pending: m.rebuildPending,
+	}
+	m.mu.Unlock()
+	return m.runRebuild(run)
 }
 
 func (m *Manager) syncAfterSetLocked(key string, normalized []float32, existed bool) error {
@@ -445,7 +496,7 @@ func (m *Manager) syncAfterSetLocked(key string, normalized []float32, existed b
 
 	case ModeBruteForce, ModeHNSW:
 		if m.state != StateReady || m.index == nil {
-			_ = m.rebuildFromStoreLocked() // storage already committed
+			m.startRebuildLocked() // storage already committed
 			return nil
 		}
 		if existed {
@@ -473,7 +524,7 @@ func (m *Manager) syncAfterSetLocked(key string, normalized []float32, existed b
 			return nil
 		}
 		if m.state != StateReady || m.index == nil {
-			_ = m.rebuildFromStoreLocked() // storage already committed
+			m.startRebuildLocked() // storage already committed
 			return nil
 		}
 		if existed {
@@ -494,8 +545,13 @@ func (m *Manager) syncAfterSetLocked(key string, normalized []float32, existed b
 }
 
 func (m *Manager) maybeRebuildLocked() {
+	if m.rebuilding {
+		// An in-flight rebuild publishes a consistent index at its swap;
+		// mutations are folded in via rebuildPending.
+		return
+	}
 	if m.state == StateDirty {
-		_ = m.rebuildFromStoreLocked()
+		m.startRebuildLocked()
 		return
 	}
 	if m.state != StateReady || m.index == nil {
@@ -509,66 +565,130 @@ func (m *Manager) maybeRebuildLocked() {
 		return
 	}
 	if float64(m.mutationSinceBuild) >= float64(n)*m.rebuildDeleteRatio {
-		_ = m.rebuildFromStoreLocked()
+		m.startRebuildLocked()
 	}
 }
 
 // dropIndexLocked unpublishes the secondary index without Clear() so concurrent
 // Search calls holding the old pointer can finish safely.
 func (m *Manager) dropIndexLocked() {
+	m.rebuildGen++
 	m.restoreBodiesLocked()
 	m.index = nil
 	m.state = StateDormant
 	m.mutationSinceBuild = 0
 }
 
-// rebuildFromStoreLocked builds a fresh index from a consistent snapshot and swaps it in.
-// The previous index is not Clear()'d so in-flight Search on the old pointer remains valid.
-func (m *Manager) rebuildFromStoreLocked() error {
-	if m.mode == ModeNone {
-		return nil
+// rebuildRun carries one rebuild's inputs from its start to its swap.
+type rebuildRun struct {
+	// gen is rebuildGen at start; a mismatch means the index was dropped
+	// or cleared during the build and the swap must be abandoned.
+	gen int
+	// snap is the consistent storage snapshot the new index is built from.
+	snap map[string][]float32
+	// pending holds keys mutated while the build runs (guarded by m.mu).
+	pending map[string]struct{}
+}
+
+// startRebuildLocked snapshots storage under the already-held write lock and
+// launches the index build in the background, so reads and writes keep
+// running on the old index while the new one is built. Caller holds m.mu.
+func (m *Manager) startRebuildLocked() {
+	if m.mode == ModeNone || m.rebuilding {
+		return
 	}
 	if m.mode == ModeAuto && m.store.Count() < m.autoMin {
 		m.dropIndexLocked()
-		return nil
+		return
 	}
 	if m.newIndex == nil {
 		m.state = StateDirty
-		return fmt.Errorf("no index factory configured")
+		return
 	}
+	m.rebuilding = true
+	m.rebuildPending = make(map[string]struct{})
+	run := &rebuildRun{
+		gen:     m.rebuildGen,
+		snap:    m.snapshotLocked(),
+		pending: m.rebuildPending,
+	}
+	go func() { _ = m.runRebuild(run) }()
+}
 
-	snap := m.snapshotLocked()
-	keys := make([]string, 0, len(snap))
-	for k := range snap {
+// runRebuild inserts the snapshot into a private index without holding the
+// manager lock, then briefly takes the write lock to fold mutations that
+// happened during the build into the new index and publish the swap.
+// The previous index is not Clear()'d so in-flight Search on the old pointer
+// remains valid. Called synchronously by Rebuild, in the background by
+// startRebuildLocked.
+func (m *Manager) runRebuild(run *rebuildRun) error {
+	keys := make([]string, 0, len(run.snap))
+	for k := range run.snap {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
 	newIdx := m.newIndex()
 	for _, key := range keys {
-		if err := newIdx.Insert(key, snap[key]); err != nil {
-			// Keep a still-usable index; only mark dirty if there was none.
-			if m.index == nil || m.state != StateReady {
-				m.state = StateDirty
-			}
+		if err := newIdx.Insert(key, run.snap[key]); err != nil {
+			m.mu.Lock()
+			m.rebuildFailedLocked()
+			m.mu.Unlock()
 			return fmt.Errorf("rebuild insert %q: %w", key, err)
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.rebuildGen != run.gen {
+		// The index was dropped or cleared while building (auto shrink,
+		// Clear); the snapshot is stale, so abandon the swap.
+		m.rebuilding = false
+		m.rebuildPending = nil
+		return nil
+	}
+	for key := range run.pending {
+		if vec, ok := m.vecFor(key, m.index); ok {
+			_ = newIdx.Delete(key) // upsert: replace any snapshot copy
+			if err := newIdx.Insert(key, vec); err != nil {
+				m.rebuildFailedLocked()
+				return fmt.Errorf("rebuild insert %q: %w", key, err)
+			}
+		} else {
+			_ = newIdx.Delete(key)
 		}
 	}
 	// Atomic publish: re-point only; do not Clear the old index.
 	m.index = newIdx
 	m.state = StateReady
 	m.mutationSinceBuild = 0
+	m.rebuilding = false
+	m.rebuildPending = nil
 	if m.mode == ModeHNSW || m.mode == ModeAuto {
 		for _, key := range keys {
+			m.store.DropVector(key)
+		}
+		for key := range run.pending {
 			m.store.DropVector(key)
 		}
 	}
 	return nil
 }
 
-func (m *Manager) fallbackSearch(query []float32, k int, idx storage.Index, allow func(string) bool) ([]vector.SearchResult, error) {
+// rebuildFailedLocked discards a failed rebuild and keeps the currently
+// published index usable; only marks dirty when there was none ready.
+// Caller holds m.mu.
+func (m *Manager) rebuildFailedLocked() {
+	if m.index == nil || m.state != StateReady {
+		m.state = StateDirty
+	}
+	m.rebuilding = false
+	m.rebuildPending = nil
+}
+
+func (m *Manager) fallbackSearch(query []float32, k int, allow func(string) bool) ([]vector.SearchResult, error) {
 	if m.mode == ModeHNSW || m.mode == ModeAuto {
-		return m.searchResolved(query, k, idx, allow)
+		return m.searchResolved(query, k, allow)
 	}
 	return m.storeSearch(query, k, allow)
 }
@@ -589,7 +709,32 @@ func (m *Manager) vecFor(key string, idx storage.Index) ([]float32, bool) {
 	return m.store.Get(key)
 }
 
-func (m *Manager) searchResolved(query []float32, k int, idx storage.Index, allow func(string) bool) ([]vector.SearchResult, error) {
+// vecForLive resolves a vector body for lock-free scans (storeSearch,
+// searchResolved). A rebuild swap publishes the new index before dropping
+// storage bodies, both under the write lock, so a scan that observes a nil
+// body must resolve it through the live published index: taking the read
+// lock after seeing nil observes either the pre-swap state or the
+// already-published replacement.
+func (m *Manager) vecForLive(key string) ([]float32, bool) {
+	vec, ok := m.store.Get(key)
+	if !ok {
+		return nil, false
+	}
+	if vec != nil {
+		return vec, true
+	}
+	m.mu.RLock()
+	idx := m.index
+	m.mu.RUnlock()
+	if idx != nil {
+		if v, ok := idx.Get(key); ok {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
+func (m *Manager) searchResolved(query []float32, k int, allow func(string) bool) ([]vector.SearchResult, error) {
 	normalizedQuery, err := vector.Normalize(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to normalize query: %w", err)
@@ -600,7 +745,7 @@ func (m *Manager) searchResolved(query []float32, k int, idx storage.Index, allo
 		if allow != nil && !allow(key) {
 			continue
 		}
-		vec, ok := m.vecFor(key, idx)
+		vec, ok := m.vecForLive(key)
 		if !ok {
 			continue
 		}
