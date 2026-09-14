@@ -1262,7 +1262,7 @@ func TestSearchProceedsDuringIndexInsert(t *testing.T) {
 		release: release,
 	}
 	m, err := NewManager(storage.New(), Config{
-		Mode:    ModeHNSW,
+		Mode:     ModeHNSW,
 		NewIndex: func() storage.Index { return idx },
 	})
 	if err != nil {
@@ -1367,7 +1367,7 @@ func TestSearchProceedsDuringIndexInsert(t *testing.T) {
 // keeps storage bodies, so the store remains the observable truth.
 func TestConcurrentWritesKeepIndexMatchingStore(t *testing.T) {
 	m, err := NewManager(storage.New(), Config{
-		Mode:    ModeBruteForce,
+		Mode: ModeBruteForce,
 		NewIndex: func() storage.Index {
 			return storage.NewBruteForceIndex()
 		},
