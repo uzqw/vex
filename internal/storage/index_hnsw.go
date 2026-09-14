@@ -225,6 +225,37 @@ func NewHNSWIndexWithConfig(config HNSWConfig) *HNSWIndex {
 	}
 }
 
+// Presize reserves capacity for n vectors of the given dimension so a
+// bulk insert (index rebuild, snapshot restore) does not regrow the
+// packed vecs array, nodes slice, and keys map. No-op when dim is 0 or
+// the index already has a different dimension.
+func (h *HNSWIndex) Presize(n, dim int) {
+	if n <= 0 || dim <= 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.dim == 0 {
+		h.dim = dim
+	} else if h.dim != dim {
+		return
+	}
+	if cap(h.vecs) < n*h.dim {
+		vecs := make([]float32, len(h.vecs), n*h.dim)
+		copy(vecs, h.vecs)
+		h.vecs = vecs
+	}
+	if cap(h.nodes) < n {
+		nodes := make([]hnswNode, len(h.nodes), n)
+		copy(nodes, h.nodes)
+		h.nodes = nodes
+	}
+	// Go maps grow fine on their own; only preallocate when empty.
+	if len(h.keys) == 0 {
+		h.keys = make(map[string]int32, n)
+	}
+}
+
 // assignLevel assigns a random level to a new node using exponential decay distribution.
 // Uses r in (0,1] so Log never sees 0.
 func (h *HNSWIndex) assignLevel() int {

@@ -585,3 +585,27 @@ func TestDistanceBetween(t *testing.T) {
 		t.Errorf("distance for orthogonal vectors = %f, want ~0", d2)
 	}
 }
+
+func TestHNSWPresize(t *testing.T) {
+	h := NewHNSWIndex()
+	h.Presize(4, 3)
+	if cap(h.vecs) < 12 || cap(h.nodes) < 4 {
+		t.Fatalf("presize did not reserve: cap vecs=%d nodes=%d", cap(h.vecs), cap(h.nodes))
+	}
+	for _, k := range []string{"a", "b", "c", "d"} {
+		if err := h.Insert(k, makeNormVec(1, 0, 0)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if h.Count() != 4 {
+		t.Fatalf("count = %d, want 4", h.Count())
+	}
+	// Presize on an index that already has a different dim is a no-op.
+	if err := h.Insert("e", makeNormVec(1, 0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	h.Presize(100, 7)
+	if h.dim != 3 {
+		t.Fatalf("dim = %d, want unchanged 3", h.dim)
+	}
+}

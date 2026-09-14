@@ -805,6 +805,11 @@ func (m *Manager) startRebuildLocked() {
 // background by startRebuildLocked.
 func (m *Manager) runRebuild(run *rebuildRun) error {
 	newIdx := m.newIndex()
+	// Presize the packed vector array when the count is known; the store
+	// dimension is already fixed for any non-empty rebuild.
+	if p, ok := newIdx.(interface{ Presize(n, dim int) }); ok {
+		p.Presize(len(run.keys), m.store.Dimension())
+	}
 	for _, key := range run.keys {
 		vec, ok := m.vecForLive(key)
 		if !ok {
