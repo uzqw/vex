@@ -274,6 +274,15 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 	reader := protocol.NewRESPReader(conn)
 	writer := protocol.NewRESPWriter(conn)
 
+	// Read deadline reaps idle connections. Renewed lazily — only when the
+	// pending deadline would fire within renewWindow — so busy connections
+	// pay at most one SetReadDeadline syscall per renewWindow instead of one
+	// per command. Idle disconnect fires 30–60s after the last command.
+	const idleTimeout = 60 * time.Second
+	const renewWindow = 30 * time.Second
+	deadline := time.Now().Add(idleTimeout)
+	_ = conn.SetReadDeadline(deadline)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -281,8 +290,10 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 		default:
 		}
 
-		// Set read deadline to detect idle connections
-		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		if time.Until(deadline) < renewWindow {
+			deadline = time.Now().Add(idleTimeout)
+			_ = conn.SetReadDeadline(deadline)
+		}
 
 		// Read command
 		cmd, err := reader.ReadCommand()
@@ -477,18 +488,19 @@ func handleVGet(writer *protocol.RESPWriter, cmd []string) {
 		return
 	}
 
-	// Format vector as string
-	var sb strings.Builder
-	sb.WriteString("[")
+	// Format vector as string; strconv.AppendFloat avoids a fmt.Sprintf
+	// allocation per element.
+	buf := make([]byte, 0, len(values)*10+2)
+	buf = append(buf, '[')
 	for i, v := range values {
 		if i > 0 {
-			sb.WriteString(", ")
+			buf = append(buf, ',', ' ')
 		}
-		sb.WriteString(fmt.Sprintf("%.6f", v))
+		buf = strconv.AppendFloat(buf, float64(v), 'f', 6, 32)
 	}
-	sb.WriteString("]")
+	buf = append(buf, ']')
 
-	_ = writer.WriteBulkString(sb.String())
+	_ = writer.WriteBulkString(string(buf))
 }
 
 // handleVDel handles the VDEL command: VDEL key

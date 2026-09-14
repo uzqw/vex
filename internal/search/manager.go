@@ -393,17 +393,19 @@ func (m *Manager) storeSearch(query []float32, k int, allow func(string) bool) (
 	}
 	h := &vector.TopKHeap{}
 	heap.Init(h)
-	for _, key := range m.store.GetAllKeys() {
-		if allow != nil && !allow(key) {
-			continue
+	var scanErr error
+	m.store.Scan(func(key string) {
+		if scanErr != nil || (allow != nil && !allow(key)) {
+			return
 		}
 		vec, ok := m.vecForLive(key)
 		if !ok {
-			continue
+			return
 		}
 		similarity, err := vector.DotProduct(normalizedQuery, vec)
 		if err != nil {
-			return nil, err
+			scanErr = err
+			return
 		}
 		if h.Len() < k {
 			heap.Push(h, vector.SearchResult{Key: key, Similarity: similarity})
@@ -411,6 +413,9 @@ func (m *Manager) storeSearch(query []float32, k int, allow func(string) bool) (
 			heap.Pop(h)
 			heap.Push(h, vector.SearchResult{Key: key, Similarity: similarity})
 		}
+	})
+	if scanErr != nil {
+		return nil, scanErr
 	}
 	results := make([]vector.SearchResult, h.Len())
 	for i := len(results) - 1; i >= 0; i-- {
@@ -926,17 +931,19 @@ func (m *Manager) searchResolved(query []float32, k int, allow func(string) bool
 	}
 	h := &vector.TopKHeap{}
 	heap.Init(h)
-	for _, key := range m.store.GetAllKeys() {
-		if allow != nil && !allow(key) {
-			continue
+	var scanErr error
+	m.store.Scan(func(key string) {
+		if scanErr != nil || (allow != nil && !allow(key)) {
+			return
 		}
 		vec, ok := m.vecForLive(key)
 		if !ok {
-			continue
+			return
 		}
 		similarity, err := vector.DotProduct(normalizedQuery, vec)
 		if err != nil {
-			return nil, err
+			scanErr = err
+			return
 		}
 		if h.Len() < k {
 			heap.Push(h, vector.SearchResult{Key: key, Similarity: similarity})
@@ -944,6 +951,9 @@ func (m *Manager) searchResolved(query []float32, k int, allow func(string) bool
 			heap.Pop(h)
 			heap.Push(h, vector.SearchResult{Key: key, Similarity: similarity})
 		}
+	})
+	if scanErr != nil {
+		return nil, scanErr
 	}
 	results := make([]vector.SearchResult, h.Len())
 	for i := len(results) - 1; i >= 0; i-- {

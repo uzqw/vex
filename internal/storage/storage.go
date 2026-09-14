@@ -195,7 +195,10 @@ func (s *Storage) Count() int {
 }
 
 // Search finds the top-K most similar vectors to the query vector
-// Uses concurrent scanning across shards for better performance
+// Uses concurrent scanning across shards for better performance.
+// Shard 0 is scanned on the calling goroutine and results are collected
+// through a fixed array instead of a channel, so each query spawns
+// ShardCount-1 goroutines rather than ShardCount+1.
 func (s *Storage) Search(query []float32, k int) ([]vector.SearchResult, error) {
 	// Normalize query vector for optimized comparison with stored normalized vectors
 	normalizedQuery, err := vector.Normalize(query)
@@ -203,62 +206,53 @@ func (s *Storage) Search(query []float32, k int) ([]vector.SearchResult, error) 
 		return nil, fmt.Errorf("failed to normalize query: %w", err)
 	}
 
-	// Channel to collect results from each shard
-	type shardResult struct {
-		results []vector.SearchResult
-		err     error
-	}
-	resultChan := make(chan shardResult, ShardCount)
+	var shardResults [ShardCount][]vector.SearchResult
+	var shardErrs [ShardCount]error
 
-	// Launch concurrent search across all shards
+	scanShard := func(shardIdx int) {
+		shard := s.shards[shardIdx]
+		shard.mu.RLock()
+		defer shard.mu.RUnlock()
+
+		var results []vector.SearchResult
+		for key, vec := range shard.data {
+			if vec == nil {
+				continue
+			}
+			// Since both vectors are normalized, dot product = cosine similarity
+			similarity, err := vector.DotProduct(normalizedQuery, vec)
+			if err != nil {
+				shardErrs[shardIdx] = err
+				return
+			}
+			results = append(results, vector.SearchResult{
+				Key:        key,
+				Similarity: similarity,
+			})
+		}
+		shardResults[shardIdx] = results
+	}
+
 	var wg sync.WaitGroup
-	for i := 0; i < ShardCount; i++ {
-		wg.Add(1)
+	wg.Add(ShardCount - 1)
+	for i := 1; i < ShardCount; i++ {
 		go func(shardIdx int) {
 			defer wg.Done()
-
-			shard := s.shards[shardIdx]
-			shard.mu.RLock()
-			defer shard.mu.RUnlock()
-
-			var results []vector.SearchResult
-			for key, vec := range shard.data {
-				if vec == nil {
-					continue
-				}
-				// Since both vectors are normalized, dot product = cosine similarity
-				similarity, err := vector.DotProduct(normalizedQuery, vec)
-				if err != nil {
-					resultChan <- shardResult{err: err}
-					return
-				}
-
-				results = append(results, vector.SearchResult{
-					Key:        key,
-					Similarity: similarity,
-				})
-			}
-
-			resultChan <- shardResult{results: results}
+			scanShard(shardIdx)
 		}(i)
 	}
-
-	// Wait for all goroutines to finish
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
+	scanShard(0)
+	wg.Wait()
 
 	// Merge results using a min-heap to maintain top-K
 	h := &vector.TopKHeap{}
 	heap.Init(h)
 
-	for result := range resultChan {
-		if result.err != nil {
-			return nil, result.err
+	for i := 0; i < ShardCount; i++ {
+		if shardErrs[i] != nil {
+			return nil, shardErrs[i]
 		}
-
-		for _, res := range result.results {
+		for _, res := range shardResults[i] {
 			if h.Len() < k {
 				heap.Push(h, res)
 			} else if res.Similarity > (*h)[0].Similarity {
@@ -293,6 +287,32 @@ func (s *Storage) Clear() {
 // Dimension returns the expected vector dimension (0 if no vectors stored yet)
 func (s *Storage) Dimension() int {
 	return int(s.dim.Load())
+}
+
+// Scan calls fn for every key in storage, one shard at a time. Unlike
+// GetAllKeys it never materializes a full key list: each shard's keys are
+// staged in a reused buffer bounded by the largest shard, so filtered
+// scans pay no O(n) key allocation. fn runs after the shard read lock is
+// released, so it may safely call back into Storage (Get, Match, ...);
+// keys staged but since deleted are the caller's to skip, same as a
+// GetAllKeys snapshot.
+func (s *Storage) Scan(fn func(key string)) {
+	var buf []string
+	for i := 0; i < ShardCount; i++ {
+		shard := s.shards[i]
+		shard.mu.RLock()
+		if cap(buf) < len(shard.data) {
+			buf = make([]string, 0, len(shard.data))
+		}
+		buf = buf[:0]
+		for key := range shard.data {
+			buf = append(buf, key)
+		}
+		shard.mu.RUnlock()
+		for _, key := range buf {
+			fn(key)
+		}
+	}
 }
 
 // GetAllKeys returns all keys currently in storage

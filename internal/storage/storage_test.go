@@ -253,6 +253,46 @@ func TestStorageGetAllKeys(t *testing.T) {
 	})
 }
 
+func TestStorageScan(t *testing.T) {
+	s := New()
+	want := make(map[string]bool)
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("k%d", i)
+		_ = s.Set(key, []float32{1, 0})
+		want[key] = true
+	}
+
+	seen := make(map[string]bool)
+	s.Scan(func(key string) {
+		// Callback may call back into Storage: the shard lock is released.
+		if _, ok := s.Get(key); !ok {
+			t.Errorf("Scan key %q not Gettable", key)
+		}
+		seen[key] = true
+	})
+	if len(seen) != len(want) {
+		t.Fatalf("Scan visited %d keys, want %d", len(seen), len(want))
+	}
+	for k := range want {
+		if !seen[k] {
+			t.Errorf("Scan missed key %q", k)
+		}
+	}
+
+	// Keys deleted mid-scan may be visited; callers skip them via Get.
+	s.Delete("k0")
+	visited := 0
+	s.Scan(func(key string) {
+		visited++
+		if _, ok := s.Get(key); !ok && key != "k0" {
+			t.Errorf("unexpected missing key %q", key)
+		}
+	})
+	if visited < len(want)-1 {
+		t.Errorf("Scan after delete visited %d keys, want >= %d", visited, len(want)-1)
+	}
+}
+
 func BenchmarkStorageSet(b *testing.B) {
 	s := New()
 	vec := make([]float32, 128)
