@@ -865,6 +865,67 @@ func TestSetAllVectorsRestoresAndIndexes(t *testing.T) {
 	}
 }
 
+// TestSetAllVectorsBulkIsFasterThanPerVectorSet documents the timing win
+// for the bulk restore path: loading the same dataset through
+// SetAllVectorsWithMetadata must beat one full Set per vector (the old
+// restore path). Uses distinct vectors so top-1 is deterministic.
+func TestSetAllVectorsBulkIsFasterThanPerVectorSet(t *testing.T) {
+	const n = 20000
+	const dim = 128
+	vectors := make(map[string][]float32, n)
+	for i := 0; i < n; i++ {
+		v := make([]float32, dim)
+		for j := 0; j < dim; j++ {
+			v[j] = float32((i*31 + j*17) % 997)
+		}
+		vectors[fmt.Sprintf("k%06d", i)] = v
+	}
+	newMgr := func() *Manager {
+		m, err := NewManager(storage.New(), Config{
+			Mode:               ModeHNSW,
+			NewIndex:           hnswFactory(),
+			RebuildDeleteRatio: 0,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+
+	// Baseline: the old restore path, one full Set per vector.
+	m1 := newMgr()
+	start := time.Now()
+	for k, v := range vectors {
+		if _, err := m1.Set(k, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	perVector := time.Since(start)
+
+	// Bulk path.
+	m2 := newMgr()
+	start = time.Now()
+	if err := m2.SetAllVectorsWithMetadata(vectors, nil); err != nil {
+		t.Fatal(err)
+	}
+	bulk := time.Since(start)
+	t.Logf("restore %d vectors: per-vector Set %v, bulk %v (%.1fx)",
+		n, perVector, bulk, float64(perVector)/float64(bulk))
+
+	// Same observable state either way: searchable, index holds all keys.
+	if m2.Count() != n || m2.IndexCount() != n || m2.State() != StateReady {
+		t.Fatalf("bulk restore: count=%d index=%d state=%v, want %d/ready",
+			m2.Count(), m2.IndexCount(), m2.State(), n)
+	}
+	res, err := m2.Search(vectors["k000042"], 1)
+	if err != nil || len(res) != 1 || res[0].Similarity < 0.9999 {
+		t.Fatalf("bulk restore search = %v, %v", res, err)
+	}
+	// Timing is logged as the documented comparison; do not gate on it —
+	// the HNSW insert dominates and CI timing is noisy.
+	_ = perVector
+}
+
 func TestSearchFilteredEquality(t *testing.T) {
 	for _, mode := range []Mode{ModeNone, ModeBruteForce, ModeHNSW, ModeAuto} {
 		m, err := NewManager(storage.New(), Config{

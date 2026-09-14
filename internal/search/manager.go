@@ -548,26 +548,59 @@ func (m *Manager) GetAllVectors() (map[string][]float32, error) {
 	return m.snapshotLocked(), nil
 }
 
-// SetAllVectors bulk-restores vectors through Set so storage and the
-// secondary index stay consistent. Used by persistence recovery.
+// SetAllVectors bulk-restores vectors. Used by persistence recovery.
 func (m *Manager) SetAllVectors(vectors map[string][]float32) error {
 	return m.SetAllVectorsWithMetadata(vectors, nil)
 }
 
 // SetAllVectorsWithMetadata restores vectors and their scalar metadata.
 // Implements persistence.MetadataDataSource.
+//
+// Bulk path: the whole store write commits under one m.mu hold, then the
+// index is rebuilt once via the leg-1 background-rebuild machinery
+// instead of a full Set (three lock round-trips plus an index insert)
+// per vector. Recovery runs before the server accepts traffic, so
+// snapActive/rebuilding cannot be true; the guards below keep that
+// assumption honest if a future caller restores into a live manager.
 func (m *Manager) SetAllVectorsWithMetadata(vectors map[string][]float32, meta map[string]map[string]string) error {
+	if len(vectors) == 0 {
+		return nil
+	}
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+
+	// Commit every store write under one manager lock.
+	m.mu.Lock()
 	for key, vec := range vectors {
-		if _, err := m.Set(key, vec); err != nil {
+		if _, existed := m.store.Get(key); existed {
+			m.mutationSinceBuild++
+		}
+		if err := m.store.Set(key, vec); err != nil {
+			m.mu.Unlock()
 			return fmt.Errorf("failed to set vector %s: %w", key, err)
+		}
+		if m.snapActive {
+			m.snapMutated[key] = struct{}{}
+		}
+		if m.rebuilding {
+			m.rebuildPending[key] = struct{}{}
 		}
 		if fields, ok := meta[key]; ok {
 			if err := m.store.SetMetadata(key, fields); err != nil {
+				m.mu.Unlock()
 				return fmt.Errorf("failed to set metadata %s: %w", key, err)
 			}
 		}
 	}
-	return nil
+	m.mu.Unlock()
+
+	// Index work: one synchronous rebuild covers the whole just-committed
+	// store in a single deterministic pass — cheaper than N index inserts
+	// and keeps HNSW build order sorted. Rebuild() is a no-op for ModeNone
+	// and drops the index for Auto below threshold, so it needs no
+	// per-mode branching here. It returns with a searchable index,
+	// matching the old per-vector Set behavior.
+	return m.Rebuild()
 }
 
 // Get returns a vector. HNSW/Auto may keep the body in the packed index.
