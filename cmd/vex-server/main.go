@@ -25,8 +25,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"runtime"
 	"runtime/debug"
+	runtimemetrics "runtime/metrics"
 	"strconv"
 	"strings"
 	"syscall"
@@ -608,14 +608,24 @@ func monitorMemory(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
+	// runtime/metrics reads avoid the stop-the-world pause of runtime.ReadMemStats.
+	// allocs minus frees approximates MemStats.Alloc (live heap bytes).
+	samples := []runtimemetrics.Sample{
+		{Name: "/gc/heap/allocs:bytes"},
+		{Name: "/gc/heap/frees:bytes"},
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			var m runtime.MemStats
-			runtime.ReadMemStats(&m)
-			metrics.Global().SetMemoryUsage(m.Alloc)
+			runtimemetrics.Read(samples)
+			allocs := samples[0].Value.Uint64()
+			frees := samples[1].Value.Uint64()
+			if allocs >= frees {
+				metrics.Global().SetMemoryUsage(allocs - frees)
+			}
 		}
 	}
 }
