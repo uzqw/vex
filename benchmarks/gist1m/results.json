@@ -24,11 +24,11 @@
     618475,
     620273
   ],
-  "insert_seconds": 596.1,
-  "insert_vecs_per_sec": 1677.4,
+  "insert_seconds": 586.6,
+  "insert_vecs_per_sec": 1704.6,
   "warmup_seconds": 2.3,
-  "search_seconds": 2.3,
-  "qps": 436.71,
+  "search_seconds": 2.2,
+  "qps": 446.28,
   "recall_at_10": 0.9284,
   "groundtruth": "cosine_l2_normalized",
   "official_1m": true
